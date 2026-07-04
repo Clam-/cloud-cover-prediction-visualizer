@@ -709,7 +709,7 @@ class HorizonApp {
     if (Math.hypot(event.clientX - this.drag.startX, event.clientY - this.drag.startY) > 4) {
       this.drag.moved = true;
     }
-    if (this.drag.button === 2) {
+    if (this.drag.button === 2 || this.drag.moved) {
       this.yaw -= dx * 0.004;
       this.pitch = clamp(this.pitch + dy * 0.003, -1.32, 1.32);
       this.updateCamera();

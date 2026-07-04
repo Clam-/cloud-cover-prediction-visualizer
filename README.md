@@ -15,7 +15,7 @@ Open the local Vite URL shown by the dev server.
 
 - Starts at browser geolocation when permission is available, then tries IP-derived location, then falls back to Phillip Island, Victoria.
 - Renders a first-person terrain horizon with a camera looking east by default.
-- Supports right-drag camera look controls, FOV control, height offset from terrain from -300 m to +300 m, hourly time jumps, and terrain click-to-warp.
+- Supports mouse-drag camera look controls, FOV control, height offset from terrain from -300 m to +300 m, hourly time jumps, and terrain click-to-warp.
 - Draws procedural cloud layers from cloud prediction data at low, mid, and high altitudes.
 - Places the Sun and Moon for the selected location and visualized time.
 - Provides a resizable top-down map and a Settings modal for choosing data sources and API keys.
