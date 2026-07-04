@@ -12,6 +12,7 @@ interface TerrainTile {
   data: Uint8ClampedArray;
 }
 
+const MAPBOX_TILE_CACHE_LIMIT = 128;
 const mapboxTileCache = new Map<string, Promise<TerrainTile>>();
 
 export async function loadTerrainGrid(center: LocationPoint, settings: Settings, signal?: AbortSignal): Promise<TerrainGrid> {
@@ -177,6 +178,8 @@ function loadMapboxTerrainTile(x: number, y: number, zoom: number, token: string
   const key = `${zoom}/${x}/${y}/${token.slice(0, 8)}`;
   const cached = mapboxTileCache.get(key);
   if (cached) {
+    mapboxTileCache.delete(key);
+    mapboxTileCache.set(key, cached);
     return cached;
   }
 
@@ -204,10 +207,27 @@ function loadMapboxTerrainTile(x: number, y: number, zoom: number, token: string
         height: image.height,
         data: image.data
       };
+    })
+    .catch((error: unknown) => {
+      if (mapboxTileCache.get(key) === promise) {
+        mapboxTileCache.delete(key);
+      }
+      throw error;
     });
 
   mapboxTileCache.set(key, promise);
+  evictMapboxTileCache();
   return promise;
+}
+
+function evictMapboxTileCache(): void {
+  while (mapboxTileCache.size > MAPBOX_TILE_CACHE_LIMIT) {
+    const oldestKey = mapboxTileCache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    mapboxTileCache.delete(oldestKey);
+  }
 }
 
 function labelForSource(source: Settings["terrainSource"]): string {

@@ -2,6 +2,10 @@ import { clamp, seededRandom } from "../geo";
 import type { CloudSnapshot, LocationPoint, Settings } from "../types";
 
 export async function loadCloudSnapshot(location: LocationPoint, time: Date, settings: Settings, signal?: AbortSignal): Promise<CloudSnapshot> {
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+
   try {
     if (settings.cloudSource === "openMeteo") {
       return await loadOpenMeteoClouds(location, time, settings, signal);
@@ -11,6 +15,9 @@ export async function loadCloudSnapshot(location: LocationPoint, time: Date, set
     }
     return syntheticClouds(location, time);
   } catch (error) {
+    if (isAbortError(error, signal)) {
+      throw error;
+    }
     const warning = error instanceof Error ? error.message : "Cloud provider failed";
     return {
       ...syntheticClouds(location, time),
@@ -137,4 +144,8 @@ async function loadOpenWeatherClouds(location: LocationPoint, time: Date, settin
 
 function normalizePercent(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? clamp(Math.round(value), 0, 100) : 0;
+}
+
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true || (error instanceof DOMException && error.name === "AbortError");
 }

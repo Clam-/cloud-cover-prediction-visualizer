@@ -6,6 +6,7 @@ interface RasterTile {
   ready: boolean;
 }
 
+const RASTER_TILE_CACHE_LIMIT = 192;
 const rasterCache = new Map<string, RasterTile>();
 
 export class MiniMap {
@@ -208,6 +209,8 @@ export class MiniMap {
     const key = `${source}:${zoom}:${wrappedX}:${clampedY}:${token.slice(0, 8)}`;
     const cached = rasterCache.get(key);
     if (cached) {
+      rasterCache.delete(key);
+      rasterCache.set(key, cached);
       return cached;
     }
     const tile: RasterTile = {
@@ -221,9 +224,23 @@ export class MiniMap {
     };
     tile.image.onerror = () => {
       tile.ready = false;
+      if (rasterCache.get(key) === tile) {
+        rasterCache.delete(key);
+      }
     };
-    tile.image.src = url;
     rasterCache.set(key, tile);
+    evictRasterCache();
+    tile.image.src = url;
     return tile;
+  }
+}
+
+function evictRasterCache(): void {
+  while (rasterCache.size > RASTER_TILE_CACHE_LIMIT) {
+    const oldestKey = rasterCache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    rasterCache.delete(oldestKey);
   }
 }

@@ -57,6 +57,7 @@ const openWeatherKey = element<HTMLInputElement>("openWeatherKey");
 const openMeteoKey = element<HTMLInputElement>("openMeteoKey");
 const terrainScale = element<HTMLInputElement>("terrainScale");
 const HEIGHT_CENTER_SNAP_METERS = 5;
+const CLOUD_RELOAD_DEBOUNCE_MS = 500;
 
 class HorizonApp {
   private readonly renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -68,7 +69,7 @@ class HorizonApp {
   private readonly cloudGroup = new THREE.Group();
   private readonly celestialGroup = new THREE.Group();
   private readonly miniMap = new MiniMap(element<HTMLCanvasElement>("miniMap"), element<HTMLElement>("miniMapPanel"), element<HTMLElement>("mapAttribution"));
-  private readonly clock = new THREE.Clock();
+  private readonly timer = new THREE.Timer();
   private readonly sunLight = new THREE.DirectionalLight("#fff3c2", 1.4);
   private readonly ambient = new THREE.HemisphereLight("#bcd7ff", "#344c32", 0.62);
 
@@ -85,9 +86,12 @@ class HorizonApp {
   private heightOffset = 2;
   private time = roundToHour(new Date());
   private loadId = 0;
+  private cloudReloadId = 0;
+  private cloudReloadTimer?: number;
   private cloudTexture?: THREE.Texture;
   private terrainAbort?: AbortController;
   private cloudAbort?: AbortController;
+  private cloudReloadAbort?: AbortController;
   private searchAbort?: AbortController;
 
   async start(): Promise<void> {
@@ -105,6 +109,7 @@ class HorizonApp {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.timer.connect(document);
     this.camera.position.set(0, this.heightOffset, 0);
     window.addEventListener("resize", () => this.resize());
   }
@@ -161,7 +166,7 @@ class HorizonApp {
         this.time = addHours(this.time, Number(button.dataset.hours));
         this.updateHud();
         this.updateSky();
-        void this.reloadClouds();
+        this.scheduleCloudReload();
       });
     });
 
@@ -281,11 +286,16 @@ class HorizonApp {
 
   private async warpTo(location: LocationPoint, faceEast: boolean): Promise<void> {
     this.loadId += 1;
+    this.cloudReloadId += 1;
     const id = this.loadId;
+    this.cancelScheduledCloudReload();
     this.terrainAbort?.abort();
     this.cloudAbort?.abort();
-    this.terrainAbort = new AbortController();
-    this.cloudAbort = new AbortController();
+    this.cloudReloadAbort?.abort();
+    const terrainController = new AbortController();
+    const cloudController = new AbortController();
+    this.terrainAbort = terrainController;
+    this.cloudAbort = cloudController;
     this.location = location;
     if (faceEast) {
       this.yaw = Math.PI / 2;
@@ -295,19 +305,31 @@ class HorizonApp {
     this.updateHud();
     this.updateStatus(`Loading ${location.label}`);
 
-    const [terrain, clouds] = await Promise.all([
-      loadTerrainGrid(location, this.settings, this.terrainAbort.signal),
-      loadCloudSnapshot(location, this.time, this.settings, this.cloudAbort.signal)
-    ]);
+    let terrain: TerrainGrid;
+    let clouds: CloudSnapshot;
+    try {
+      [terrain, clouds] = await Promise.all([
+        loadTerrainGrid(location, this.settings, terrainController.signal),
+        loadCloudSnapshot(location, this.time, this.settings, cloudController.signal)
+      ]);
+    } catch (error) {
+      if (terrainController.signal.aborted || cloudController.signal.aborted || isAbortError(error)) {
+        return;
+      }
+      this.updateStatus(errorMessage(error, "Loading location failed"));
+      return;
+    }
 
     if (id !== this.loadId) {
       return;
     }
 
     this.terrain = terrain;
-    this.clouds = clouds;
     this.buildTerrainMesh(terrain);
-    this.buildClouds(clouds);
+    if (clouds.time.getTime() === this.time.getTime()) {
+      this.clouds = clouds;
+      this.buildClouds(clouds);
+    }
     this.updateHud();
     this.updateSky();
     this.updateCamera();
@@ -315,23 +337,59 @@ class HorizonApp {
     this.updateStatus(this.statusText());
   }
 
-  private async reloadClouds(): Promise<void> {
-    this.cloudAbort?.abort();
-    this.cloudAbort = new AbortController();
-    const id = this.loadId;
-    this.updateStatus("Loading cloud data");
-    const clouds = await loadCloudSnapshot(this.location, this.time, this.settings, this.cloudAbort.signal);
-    if (id !== this.loadId) {
+  private scheduleCloudReload(): void {
+    this.cloudReloadId += 1;
+    this.cloudReloadAbort?.abort();
+    const requestId = this.cloudReloadId;
+    this.cancelScheduledCloudReload();
+    this.cloudReloadTimer = window.setTimeout(() => {
+      this.cloudReloadTimer = undefined;
+      void this.reloadClouds(requestId);
+    }, CLOUD_RELOAD_DEBOUNCE_MS);
+  }
+
+  private cancelScheduledCloudReload(): void {
+    if (this.cloudReloadTimer !== undefined) {
+      window.clearTimeout(this.cloudReloadTimer);
+      this.cloudReloadTimer = undefined;
+    }
+  }
+
+  private async reloadClouds(requestId = ++this.cloudReloadId): Promise<void> {
+    if (requestId !== this.cloudReloadId) {
       return;
     }
-    this.clouds = clouds;
-    this.buildClouds(clouds);
-    this.updateSky();
-    this.updateStatus(this.statusText());
+    this.cloudReloadAbort?.abort();
+    const controller = new AbortController();
+    this.cloudReloadAbort = controller;
+    const id = this.loadId;
+    const requestedTime = this.time;
+    this.updateStatus("Loading cloud data");
+    try {
+      const clouds = await loadCloudSnapshot(this.location, requestedTime, this.settings, controller.signal);
+      if (id !== this.loadId || requestId !== this.cloudReloadId || controller.signal.aborted || clouds.time.getTime() !== this.time.getTime()) {
+        return;
+      }
+      this.clouds = clouds;
+      this.buildClouds(clouds);
+      this.updateSky();
+      this.updateStatus(this.statusText());
+    } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) {
+        return;
+      }
+      if (id === this.loadId && requestId === this.cloudReloadId) {
+        this.updateStatus(errorMessage(error, "Loading cloud data failed"));
+      }
+    } finally {
+      if (this.cloudReloadAbort === controller) {
+        this.cloudReloadAbort = undefined;
+      }
+    }
   }
 
   private buildTerrainMesh(grid: TerrainGrid): void {
-    this.terrainGroup.clear();
+    this.disposeGroupChildren(this.terrainGroup);
     this.terrainMesh = undefined;
     this.seaMesh = undefined;
 
@@ -409,7 +467,7 @@ class HorizonApp {
   }
 
   private buildClouds(snapshot: CloudSnapshot): void {
-    this.cloudGroup.clear();
+    this.disposeGroupChildren(this.cloudGroup);
     const layers = [
       { name: "low", cover: snapshot.low, altitude: 1200, max: 26, scale: [2100, 640] },
       { name: "mid", cover: snapshot.mid, altitude: 4300, max: 28, scale: [3100, 760] },
@@ -474,7 +532,7 @@ class HorizonApp {
   }
 
   private updateSky(): void {
-    this.celestialGroup.clear();
+    this.disposeGroupChildren(this.celestialGroup);
     const sun = SunCalc.getPosition(this.time, this.location.lat, this.location.lon);
     const moon = SunCalc.getMoonPosition(this.time, this.location.lat, this.location.lon);
     const sunAltitude = sun.altitude;
@@ -506,6 +564,27 @@ class HorizonApp {
     sprite.position.copy(position);
     sprite.scale.set(size, size, 1);
     this.celestialGroup.add(sprite);
+  }
+
+  private disposeGroupChildren(group: THREE.Group): void {
+    for (const child of [...group.children]) {
+      this.disposeObject(child);
+    }
+    group.clear();
+  }
+
+  private disposeObject(object: THREE.Object3D): void {
+    object.traverse((child) => {
+      const geometry = (child as { geometry?: THREE.BufferGeometry }).geometry;
+      geometry?.dispose();
+
+      const material = (child as { material?: THREE.Material | THREE.Material[] }).material;
+      if (Array.isArray(material)) {
+        material.forEach((item) => item.dispose());
+      } else {
+        material?.dispose();
+      }
+    });
   }
 
   private celestialToWorld(azimuth: number, altitude: number, radius: number): THREE.Vector3 {
@@ -658,9 +737,10 @@ class HorizonApp {
     this.camera.updateProjectionMatrix();
   }
 
-  private animate = (): void => {
+  private animate = (timestamp?: number): void => {
     requestAnimationFrame(this.animate);
-    const elapsed = this.clock.getElapsedTime();
+    this.timer.update(timestamp);
+    const elapsed = this.timer.getElapsed();
     this.cloudGroup.children.forEach((cloud, index) => {
       cloud.position.x += Math.sin(elapsed * 0.08 + index) * 0.12;
     });
@@ -678,6 +758,14 @@ function element<T extends HTMLElement>(id: string): T {
 
 function formatSignedMeters(value: number): string {
   return `${value >= 0 ? "+" : ""}${value} m`;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }
 
 const app = new HorizonApp();
