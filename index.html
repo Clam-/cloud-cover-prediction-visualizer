@@ -22,11 +22,11 @@
         <div id="searchResults" class="search-results" hidden></div>
       </form>
 
-      <section id="heightControl" class="height-control" aria-label="Height offset">
+      <section id="heightControl" class="height-control" aria-label="Eye elevation">
         <output id="heightValue">2 m</output>
         <div class="height-gauge">
-          <button id="terrainHeightValue" class="terrain-height-value" type="button" aria-label="Reset height offset to terrain height">0 m</button>
-          <input id="heightSlider" type="range" min="-300" max="300" step="1" value="2" orient="vertical" aria-label="Height offset" />
+          <button id="terrainHeightValue" class="terrain-height-value" type="button" aria-label="Snap eye elevation to terrain height">0 m</button>
+          <input id="heightSlider" type="range" min="0" max="1000" step="1" value="2" orient="vertical" aria-label="Eye elevation" />
         </div>
         <span>Height</span>
       </section>

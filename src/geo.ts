@@ -127,3 +127,15 @@ export function latLonToWorldPixel(lon: number, lat: number, zoom: number, tileS
     y: tile.yf * tileSize
   };
 }
+
+export function worldPixelToLonLat(x: number, y: number, zoom: number, tileSize: number): LocationPoint {
+  const scale = 2 ** zoom;
+  const lon = (x / (tileSize * scale)) * 360 - 180;
+  const n = Math.PI - (2 * Math.PI * y) / (tileSize * scale);
+  const lat = radiansToDegrees(Math.atan(Math.sinh(n)));
+  return {
+    lat: clamp(lat, -85.05112878, 85.05112878),
+    lon: normalizeLongitude(lon),
+    label: `${formatCoordinate(lat, "lat")}, ${formatCoordinate(lon, "lon")}`
+  };
+}

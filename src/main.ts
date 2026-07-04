@@ -3,14 +3,16 @@ import * as THREE from "three";
 import SunCalc from "suncalc";
 import { loadCloudSnapshot } from "./data/clouds";
 import { searchLocations } from "./data/geocoders";
-import { loadTerrainGrid } from "./data/terrain";
+import { loadTerrainGrid, recenterTerrainGrid, terrainHasCoverage } from "./data/terrain";
 import {
   addHours,
   clamp,
   DEFAULT_LOCATION,
   degreesToRadians,
+  distanceMeters,
   formatCoordinate,
   formatTime,
+  hashNumber,
   offsetLocation,
   radiansToDegrees,
   roundToHour,
@@ -89,9 +91,13 @@ const mapboxToken = element<HTMLInputElement>("mapboxToken");
 const openWeatherKey = element<HTMLInputElement>("openWeatherKey");
 const openMeteoKey = element<HTMLInputElement>("openMeteoKey");
 const terrainScale = element<HTMLInputElement>("terrainScale");
-const HEIGHT_CENTER_SNAP_METERS = 5;
+const MIN_EYE_ELEVATION_METERS = 0;
+const MAX_EYE_ELEVATION_METERS = 1000;
+const HEIGHT_TERRAIN_SNAP_METERS = 5;
+const TERRAIN_REUSE_RADIUS_FRACTION = 0.55;
 const CLOUD_RELOAD_DEBOUNCE_MS = 500;
 const REALTIME_CLOUD_REFRESH_MS = 5 * 60 * 1000;
+const CLOUD_REUSE_DISTANCE_METERS = 30000;
 
 class HorizonApp {
   private readonly renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -109,6 +115,7 @@ class HorizonApp {
     element<HTMLCanvasElement>("miniMap"),
     element<HTMLElement>("miniMapPanel"),
     element<HTMLElement>("mapAttribution"),
+    (location) => void this.warpTo(location, false),
     (message) => this.updateDiagnostic("map-raster", message ? { message, severity: "warning" } : undefined)
   );
   private readonly timer = new THREE.Timer();
@@ -138,6 +145,8 @@ class HorizonApp {
   private cloudReloadAbort?: AbortController;
   private searchAbort?: AbortController;
   private pendingEyeElevation?: number;
+  private terrainDataKey?: string;
+  private cloudDataKey?: string;
 
   async start(): Promise<void> {
     this.configureRenderer();
@@ -233,18 +242,20 @@ class HorizonApp {
       void this.performSearch();
     });
 
+    heightSlider.min = String(MIN_EYE_ELEVATION_METERS);
+    heightSlider.max = String(MAX_EYE_ELEVATION_METERS);
     heightSlider.addEventListener("input", () => {
-      this.heightOffset = this.snapHeightOffset(Number(heightSlider.value));
+      this.setEyeElevation(Number(heightSlider.value));
       this.updateHud();
       this.updateCamera();
     });
     heightSlider.addEventListener("change", () => {
-      this.heightOffset = this.snapHeightOffset(Number(heightSlider.value), true);
+      this.setEyeElevation(Number(heightSlider.value), true);
       this.updateHud();
       this.updateCamera();
     });
     terrainHeightValue.addEventListener("click", () => {
-      this.heightOffset = 0;
+      this.setEyeElevation(this.terrainElevation(), true);
       this.updateHud();
       this.updateCamera();
     });
@@ -407,12 +418,23 @@ class HorizonApp {
     this.cloudReloadId += 1;
     const id = this.loadId;
     this.cancelScheduledCloudReload();
+    const previousLocation = this.location;
     this.terrainAbort?.abort();
     this.cloudAbort?.abort();
     this.cloudReloadAbort?.abort();
-    const terrainController = new AbortController();
+    this.terrainAbort = undefined;
+    const terrainDataKey = this.terrainRequestKey();
+    const reusableTerrainGrid =
+      this.terrainDataKey === terrainDataKey &&
+      this.terrain !== undefined &&
+      terrainHasCoverage(this.terrain, location, this.terrain.extentMeters * TERRAIN_REUSE_RADIUS_FRACTION)
+        ? this.terrain
+        : undefined;
+    const terrainController = reusableTerrainGrid ? undefined : new AbortController();
     const cloudController = new AbortController();
-    this.terrainAbort = terrainController;
+    if (terrainController) {
+      this.terrainAbort = terrainController;
+    }
     this.cloudAbort = cloudController;
     this.location = location;
     if (faceEast) {
@@ -425,6 +447,8 @@ class HorizonApp {
     }
     const requestedCloudMode = this.cloudMode;
     const requestedCloudTime = this.time;
+    const cloudDataKey = this.cloudRequestKey(requestedCloudMode);
+    const reusableClouds = this.reusableCloudSnapshot(previousLocation, location, requestedCloudTime, requestedCloudMode, cloudDataKey);
     this.updateHud();
     this.updateStatus(`Loading ${location.label}`);
     this.updateDiagnostic("terrain-service", undefined);
@@ -435,11 +459,11 @@ class HorizonApp {
     let clouds: CloudSnapshot;
     try {
       [terrain, clouds] = await Promise.all([
-        loadTerrainGrid(location, this.settings, terrainController.signal),
-        loadCloudSnapshot(location, requestedCloudTime, this.settings, cloudController.signal, requestedCloudMode)
+        reusableTerrainGrid ? Promise.resolve(recenterTerrainGrid(reusableTerrainGrid, location)) : loadTerrainGrid(location, this.settings, terrainController?.signal),
+        reusableClouds ? Promise.resolve({ ...reusableClouds, time: requestedCloudTime }) : loadCloudSnapshot(location, requestedCloudTime, this.settings, cloudController.signal, requestedCloudMode)
       ]);
     } catch (error) {
-      if (terrainController.signal.aborted || cloudController.signal.aborted || isAbortError(error)) {
+      if (terrainController?.signal.aborted || cloudController.signal.aborted || isAbortError(error)) {
         return;
       }
       const message = errorMessage(error, "Loading location failed");
@@ -455,14 +479,27 @@ class HorizonApp {
       return;
     }
 
-    if (this.pendingEyeElevation !== undefined) {
-      this.heightOffset = this.snapHeightOffset(this.pendingEyeElevation - terrain.groundElevation, true);
-      this.pendingEyeElevation = undefined;
-    }
+    const resolvedLocation = {
+      ...location,
+      elevation: terrain.groundElevation
+    };
+    terrain = {
+      ...terrain,
+      center: resolvedLocation
+    };
+    this.location = resolvedLocation;
+    this.terrainDataKey = terrainDataKey;
     this.terrain = terrain;
+    if (this.pendingEyeElevation !== undefined) {
+      this.setEyeElevation(this.pendingEyeElevation, true);
+      this.pendingEyeElevation = undefined;
+    } else {
+      this.setEyeElevation(this.currentEyeElevation());
+    }
     this.buildTerrainMesh(terrain);
     if (requestedCloudMode === this.cloudMode && clouds.time.getTime() === requestedCloudTime.getTime()) {
       this.clouds = clouds;
+      this.cloudDataKey = cloudDataKey;
       this.buildClouds(clouds);
     }
     this.updateHud();
@@ -506,6 +543,7 @@ class HorizonApp {
     }
     const requestedTime = this.time;
     const requestedMode = this.cloudMode;
+    const cloudDataKey = this.cloudRequestKey(requestedMode);
     this.updateStatus("Loading cloud data");
     this.updateDiagnostic("cloud-service", undefined);
     try {
@@ -520,6 +558,7 @@ class HorizonApp {
         return;
       }
       this.clouds = clouds;
+      this.cloudDataKey = cloudDataKey;
       this.buildClouds(clouds);
       this.updateHud();
       this.updateSky();
@@ -842,6 +881,7 @@ class HorizonApp {
     this.cloudMode = mode;
     if (mode !== previousMode) {
       this.clouds = undefined;
+      this.cloudDataKey = undefined;
       this.disposeGroupChildren(this.cloudGroup);
     }
     this.updateDataModeUi();
@@ -886,14 +926,14 @@ class HorizonApp {
   }
 
   private updateHud(): void {
-    const terrainHeight = Math.round(this.terrain?.groundElevation ?? 0);
-    const relativeHeight = Math.round(this.heightOffset);
-    const absoluteHeight = terrainHeight + relativeHeight;
-    heightValue.textContent = `${absoluteHeight} m\n(${formatSignedMeters(relativeHeight)})`;
+    const terrainHeight = Math.round(this.terrainElevation());
+    const eyeElevation = Math.round(this.currentEyeElevation());
+    const relativeHeight = eyeElevation - terrainHeight;
+    heightValue.textContent = `${eyeElevation} m\n(${formatSignedMeters(relativeHeight)})`;
     terrainHeightValue.textContent = `${terrainHeight} m`;
     fovValue.textContent = `${Math.round(this.fov)} deg`;
     timeValue.textContent = this.cloudMode === "realtime" ? `Now · ${formatTime(this.time)}` : formatTime(this.time);
-    heightSlider.value = String(this.heightOffset);
+    heightSlider.value = String(clamp(eyeElevation, MIN_EYE_ELEVATION_METERS, MAX_EYE_ELEVATION_METERS));
     fovSlider.value = String(this.fov);
     this.updateCloudReadout();
   }
@@ -914,12 +954,67 @@ class HorizonApp {
     setMeter(cloudHighMeter, high, this.clouds !== undefined);
   }
 
-  private snapHeightOffset(value: number, force = false): number {
-    const rounded = Math.round(value);
-    if (Math.abs(rounded) <= HEIGHT_CENTER_SNAP_METERS || (force && Math.abs(rounded) <= HEIGHT_CENTER_SNAP_METERS * 2)) {
-      return 0;
+  private setEyeElevation(value: number, force = false): void {
+    this.heightOffset = this.heightOffsetForEyeElevation(value, force);
+  }
+
+  private heightOffsetForEyeElevation(value: number, force = false): number {
+    return this.snapEyeElevation(value, force) - this.terrainElevation();
+  }
+
+  private snapEyeElevation(value: number, force = false): number {
+    const rounded = clamp(Math.round(value), MIN_EYE_ELEVATION_METERS, MAX_EYE_ELEVATION_METERS);
+    const terrainHeight = clamp(Math.round(this.terrainElevation()), MIN_EYE_ELEVATION_METERS, MAX_EYE_ELEVATION_METERS);
+    const snapDistance = force ? HEIGHT_TERRAIN_SNAP_METERS * 2 : HEIGHT_TERRAIN_SNAP_METERS;
+    return Math.abs(rounded - terrainHeight) <= snapDistance ? terrainHeight : rounded;
+  }
+
+  private terrainElevation(): number {
+    return this.terrain?.groundElevation ?? this.location.elevation ?? 0;
+  }
+
+  private currentEyeElevation(): number {
+    return this.terrainElevation() + this.heightOffset;
+  }
+
+  private terrainRequestKey(): string {
+    const mapboxKey = this.settings.apiKeys.mapbox.trim();
+    const openMeteoKey = this.settings.apiKeys.openMeteo.trim();
+    return [
+      this.settings.terrainSource,
+      mapboxKey ? hashNumber(mapboxKey).toString(36) : "no-mapbox",
+      openMeteoKey ? hashNumber(openMeteoKey).toString(36) : "open-meteo-public"
+    ].join(":");
+  }
+
+  private cloudRequestKey(mode: CloudDataMode): string {
+    const openWeatherKey = this.settings.apiKeys.openWeather.trim();
+    const openMeteoKey = this.settings.apiKeys.openMeteo.trim();
+    return [
+      this.settings.cloudSource,
+      mode,
+      openWeatherKey ? hashNumber(openWeatherKey).toString(36) : "no-open-weather",
+      openMeteoKey ? hashNumber(openMeteoKey).toString(36) : "open-meteo-public"
+    ].join(":");
+  }
+
+  private reusableCloudSnapshot(
+    previousLocation: LocationPoint,
+    nextLocation: LocationPoint,
+    requestedTime: Date,
+    requestedMode: CloudDataMode,
+    cloudDataKey: string
+  ): CloudSnapshot | undefined {
+    if (!this.clouds || this.cloudDataKey !== cloudDataKey || this.clouds.dataMode !== requestedMode) {
+      return undefined;
     }
-    return rounded;
+    if (distanceMeters(previousLocation, nextLocation) > CLOUD_REUSE_DISTANCE_METERS) {
+      return undefined;
+    }
+    if (requestedMode === "realtime") {
+      return Math.abs(requestedTime.getTime() - this.clouds.time.getTime()) <= REALTIME_CLOUD_REFRESH_MS ? this.clouds : undefined;
+    }
+    return this.clouds.time.getTime() === requestedTime.getTime() ? this.clouds : undefined;
   }
 
   private updateStatus(message: string): void {

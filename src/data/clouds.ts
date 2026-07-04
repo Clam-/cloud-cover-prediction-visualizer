@@ -1,5 +1,43 @@
-import { clamp, seededRandom } from "../geo";
+import { clamp, hashNumber, seededRandom } from "../geo";
+import { readPersistentCache, writePersistentCache } from "./cache";
 import type { CloudDataMode, CloudSnapshot, LocationPoint, Settings } from "../types";
+
+interface OpenMeteoForecastBody {
+  utc_offset_seconds?: number;
+  hourly?: {
+    time?: string[];
+    cloud_cover?: number[];
+    cloud_cover_low?: number[];
+    cloud_cover_mid?: number[];
+    cloud_cover_high?: number[];
+  };
+}
+
+interface OpenMeteoCurrentBody {
+  utc_offset_seconds?: number;
+  current?: {
+    time?: string;
+    cloud_cover?: number;
+  };
+  hourly?: {
+    time?: string[];
+    cloud_cover?: number[];
+    cloud_cover_low?: number[];
+    cloud_cover_mid?: number[];
+    cloud_cover_high?: number[];
+  };
+}
+
+interface OpenWeatherBody {
+  current?: { dt?: number; clouds?: number };
+  hourly?: Array<{ dt: number; clouds?: number }>;
+}
+
+const CLOUD_LOCATION_PRECISION = 4;
+const OPEN_METEO_FORECAST_TTL_MS = 6 * 60 * 60 * 1000;
+const OPEN_METEO_CURRENT_TTL_MS = 5 * 60 * 1000;
+const OPEN_WEATHER_FORECAST_TTL_MS = 2 * 60 * 60 * 1000;
+const OPEN_WEATHER_CURRENT_TTL_MS = 10 * 60 * 1000;
 
 export async function loadCloudSnapshot(
   location: LocationPoint,
@@ -69,20 +107,14 @@ async function loadOpenMeteoForecastClouds(location: LocationPoint, time: Date, 
     params.set("apikey", settings.apiKeys.openMeteo);
   }
 
-  const response = await fetch(`${endpoint}?${params.toString()}`, { signal });
-  if (!response.ok) {
-    throw new Error(`Open-Meteo forecast returned ${response.status}`);
-  }
-  const body = (await response.json()) as {
-    utc_offset_seconds?: number;
-    hourly?: {
-      time?: string[];
-      cloud_cover?: number[];
-      cloud_cover_low?: number[];
-      cloud_cover_mid?: number[];
-      cloud_cover_high?: number[];
-    };
-  };
+  const url = `${endpoint}?${params.toString()}`;
+  const body = await loadCachedJson<OpenMeteoForecastBody>(
+    cloudCacheKey("openMeteoForecast", location, settings.apiKeys.openMeteo),
+    OPEN_METEO_FORECAST_TTL_MS,
+    url,
+    signal,
+    "Open-Meteo forecast"
+  );
   const hourly = body.hourly;
   if (!hourly?.time?.length || !hourly.cloud_cover) {
     throw new Error("Open-Meteo forecast response did not include cloud cover");
@@ -119,24 +151,14 @@ async function loadOpenMeteoCurrentClouds(location: LocationPoint, time: Date, s
     params.set("apikey", settings.apiKeys.openMeteo);
   }
 
-  const response = await fetch(`${endpoint}?${params.toString()}`, { signal });
-  if (!response.ok) {
-    throw new Error(`Open-Meteo current conditions returned ${response.status}`);
-  }
-  const body = (await response.json()) as {
-    utc_offset_seconds?: number;
-    current?: {
-      time?: string;
-      cloud_cover?: number;
-    };
-    hourly?: {
-      time?: string[];
-      cloud_cover?: number[];
-      cloud_cover_low?: number[];
-      cloud_cover_mid?: number[];
-      cloud_cover_high?: number[];
-    };
-  };
+  const url = `${endpoint}?${params.toString()}`;
+  const body = await loadCachedJson<OpenMeteoCurrentBody>(
+    cloudCacheKey("openMeteoCurrent", location, settings.apiKeys.openMeteo),
+    OPEN_METEO_CURRENT_TTL_MS,
+    url,
+    signal,
+    "Open-Meteo current conditions"
+  );
   const hourly = body.hourly;
   const offsetMs = (body.utc_offset_seconds ?? 0) * 1000;
   const target = parseOpenMeteoLocalTime(body.current?.time, offsetMs) ?? time.getTime();
@@ -179,14 +201,14 @@ async function loadOpenWeatherClouds(
     units: "metric",
     appid: key
   });
-  const response = await fetch(`https://api.openweathermap.org/data/3.0/onecall?${params.toString()}`, { signal });
-  if (!response.ok) {
-    throw new Error(`OpenWeather One Call returned ${response.status}`);
-  }
-  const body = (await response.json()) as {
-    current?: { dt?: number; clouds?: number };
-    hourly?: Array<{ dt: number; clouds?: number }>;
-  };
+  const url = `https://api.openweathermap.org/data/3.0/onecall?${params.toString()}`;
+  const body = await loadCachedJson<OpenWeatherBody>(
+    cloudCacheKey(`openWeather:${mode}`, location, key),
+    mode === "realtime" ? OPEN_WEATHER_CURRENT_TTL_MS : OPEN_WEATHER_FORECAST_TTL_MS,
+    url,
+    signal,
+    "OpenWeather One Call"
+  );
   const targetSeconds = Math.round(time.getTime() / 1000);
   const options = [...(body.current ? [body.current] : []), ...(body.hourly ?? [])].filter((item) => typeof item.dt === "number");
   if (!options.length) {
@@ -244,6 +266,42 @@ function parseOpenMeteoLocalTime(value: string | undefined, offsetMs: number): n
   }
   const parsed = new Date(`${value}:00Z`).getTime();
   return Number.isFinite(parsed) ? parsed - offsetMs : undefined;
+}
+
+async function loadCachedJson<T>(cacheKey: string, ttlMs: number, url: string, signal: AbortSignal | undefined, label: string): Promise<T> {
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+  const cached = await readPersistentCache<T>(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+
+  const response = await fetch(url, { signal });
+  if (!response.ok) {
+    throw new Error(`${label} returned ${response.status}`);
+  }
+  const body = (await response.json()) as T;
+  await writePersistentCache(cacheKey, body, ttlMs);
+  return body;
+}
+
+function cloudCacheKey(source: string, location: LocationPoint, credential: string): string {
+  return ["cloud", source, credentialFingerprint(credential), cloudLocationBucket(location)].join(":");
+}
+
+function cloudLocationBucket(location: LocationPoint): string {
+  const lat = Math.round(location.lat * CLOUD_LOCATION_PRECISION) / CLOUD_LOCATION_PRECISION;
+  const lon = Math.round(location.lon * CLOUD_LOCATION_PRECISION) / CLOUD_LOCATION_PRECISION;
+  return `${lat.toFixed(1)},${lon.toFixed(1)}`;
+}
+
+function credentialFingerprint(credential: string): string {
+  const trimmed = credential.trim();
+  return trimmed ? hashNumber(trimmed).toString(36) : "public";
 }
 
 function isAbortError(error: unknown, signal?: AbortSignal): boolean {

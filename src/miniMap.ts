@@ -1,12 +1,15 @@
-import { clamp, latLonToWorldPixel, lonLatToTile } from "./geo";
+import { clamp, latLonToWorldPixel, lonLatToTile, offsetLocation, worldPixelToLonLat } from "./geo";
+import { fetchCachedBlob } from "./data/cache";
 import type { LocationPoint, MapSource, Settings, TerrainGrid } from "./types";
 
 interface RasterTile {
   image: HTMLImageElement;
+  objectUrl?: string;
   ready: boolean;
 }
 
 const RASTER_TILE_CACHE_LIMIT = 192;
+const RASTER_TILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const rasterCache = new Map<string, RasterTile>();
 
 export class MiniMap {
@@ -18,11 +21,13 @@ export class MiniMap {
   private settings?: Settings;
   private resizeObserver: ResizeObserver;
   private zoomOffset = 0;
+  private pointerDown?: { x: number; y: number; pointerId: number };
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
     private readonly panel: HTMLElement,
     attribution: HTMLElement,
+    private readonly onSelectLocation?: (location: LocationPoint) => void,
     private readonly reportRasterIssue?: (message?: string) => void
   ) {
     const context = canvas.getContext("2d");
@@ -43,6 +48,11 @@ export class MiniMap {
       },
       { passive: false }
     );
+    this.canvas.addEventListener("pointerdown", (event) => this.onPointerDown(event));
+    this.canvas.addEventListener("pointerup", (event) => this.onPointerUp(event));
+    this.canvas.addEventListener("pointercancel", () => {
+      this.pointerDown = undefined;
+    });
     this.resize();
   }
 
@@ -234,13 +244,89 @@ export class MiniMap {
       tile.ready = false;
       this.reportRasterIssue?.(`${source === "mapboxRaster" ? "Mapbox" : "OpenStreetMap"} map tile service issue: map tiles could not load.`);
       if (rasterCache.get(key) === tile) {
+        revokeRasterObjectUrl(tile);
         rasterCache.delete(key);
       }
     };
     rasterCache.set(key, tile);
     evictRasterCache();
-    tile.image.src = url;
+    void this.loadRasterTile(tile, key, url, source);
     return tile;
+  }
+
+  private async loadRasterTile(tile: RasterTile, key: string, url: string, source: MapSource): Promise<void> {
+    try {
+      const blob = await fetchCachedBlob("horizon-map-raster-v1", url, RASTER_TILE_TTL_MS);
+      if (rasterCache.get(key) !== tile) {
+        return;
+      }
+      revokeRasterObjectUrl(tile);
+      tile.objectUrl = URL.createObjectURL(blob);
+      tile.image.src = tile.objectUrl;
+    } catch {
+      if (rasterCache.get(key) !== tile) {
+        return;
+      }
+      this.reportRasterIssue?.(`${source === "mapboxRaster" ? "Mapbox" : "OpenStreetMap"} map tile cache issue: using direct tile loading.`);
+      tile.image.src = url;
+    }
+  }
+
+  private onPointerDown(event: PointerEvent): void {
+    if (event.button !== 0) {
+      return;
+    }
+    this.pointerDown = {
+      x: event.clientX,
+      y: event.clientY,
+      pointerId: event.pointerId
+    };
+    this.canvas.setPointerCapture(event.pointerId);
+  }
+
+  private onPointerUp(event: PointerEvent): void {
+    if (!this.pointerDown || this.pointerDown.pointerId !== event.pointerId) {
+      return;
+    }
+    const pointerDown = this.pointerDown;
+    this.pointerDown = undefined;
+    this.canvas.releasePointerCapture(event.pointerId);
+    if (Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y) > 5) {
+      return;
+    }
+
+    const location = this.locationForPointer(event);
+    if (location) {
+      this.onSelectLocation?.({
+        ...location,
+        label: `Map ${location.label}`
+      });
+    }
+  }
+
+  private locationForPointer(event: PointerEvent): LocationPoint | undefined {
+    if (!this.location) {
+      return undefined;
+    }
+
+    const rect = this.canvas.getBoundingClientRect();
+    const x = clamp(event.clientX - rect.left, 0, rect.width);
+    const y = clamp(event.clientY - rect.top, 0, rect.height);
+    const source = this.settings?.mapSource ?? "terrainCanvas";
+    if (source !== "terrainCanvas" && this.settings) {
+      const zoom = this.pickZoom(rect.width);
+      const tileSize = 256;
+      const center = latLonToWorldPixel(this.location.lon, this.location.lat, zoom, tileSize);
+      return worldPixelToLonLat(center.x - rect.width / 2 + x, center.y - rect.height / 2 + y, zoom, tileSize);
+    }
+
+    if (!this.terrain) {
+      return undefined;
+    }
+    const visibleExtent = this.terrain.extentMeters / this.currentTerrainZoom();
+    const east = (x / Math.max(rect.width, 1) - 0.5) * visibleExtent * 2;
+    const north = (0.5 - y / Math.max(rect.height, 1)) * visibleExtent * 2;
+    return offsetLocation(this.location, east, north);
   }
 }
 
@@ -250,6 +336,17 @@ function evictRasterCache(): void {
     if (oldestKey === undefined) {
       break;
     }
-    rasterCache.delete(oldestKey);
+    const tile = rasterCache.get(oldestKey);
+    if (tile) {
+      revokeRasterObjectUrl(tile);
+      rasterCache.delete(oldestKey);
+    }
+  }
+}
+
+function revokeRasterObjectUrl(tile: RasterTile): void {
+  if (tile.objectUrl) {
+    URL.revokeObjectURL(tile.objectUrl);
+    tile.objectUrl = undefined;
   }
 }
