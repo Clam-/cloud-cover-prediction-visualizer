@@ -1,5 +1,6 @@
 export type TerrainSource = "synthetic" | "openMeteo" | "mapbox";
 export type CloudSource = "synthetic" | "openMeteo" | "openWeather";
+export type CloudDataMode = "realtime" | "prediction";
 export type GeocoderSource = "openMeteo" | "nominatim" | "mapbox";
 export type MapSource = "terrainCanvas" | "osmRaster" | "mapboxRaster";
 
@@ -45,6 +46,7 @@ export interface TerrainGrid {
 
 export interface CloudSnapshot {
   time: Date;
+  dataMode: CloudDataMode;
   total: number;
   low: number;
   mid: number;

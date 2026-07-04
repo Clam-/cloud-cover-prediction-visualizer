@@ -246,6 +246,11 @@ select:focus-visible {
   text-overflow: ellipsis;
 }
 
+.time-control.is-live-time button {
+  opacity: 0.46;
+  cursor: default;
+}
+
 .fov-control {
   position: fixed;
   left: 50%;
@@ -318,12 +323,123 @@ select:focus-visible {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
 }
 
+.data-mode-control {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 10;
+  width: 246px;
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  background: rgba(18, 25, 21, 0.8);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.22);
+}
+
+.data-mode-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.data-mode-toggle button {
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.data-mode-toggle button[aria-pressed="true"] {
+  border-color: rgba(241, 203, 107, 0.82);
+  background: #e2bc63;
+  color: #151610;
+}
+
+.cloud-readout {
+  display: grid;
+  gap: 7px;
+}
+
+.cloud-readout-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 18px;
+  color: #fff6d2;
+  font-size: 12px;
+}
+
+.cloud-readout-header output {
+  font-weight: 700;
+}
+
+.cloud-total-meter,
+.cloud-layer-meter {
+  position: relative;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(218, 230, 231, 0.16);
+}
+
+.cloud-total-meter {
+  height: 10px;
+}
+
+.cloud-layer-meter {
+  height: 7px;
+}
+
+.cloud-total-meter span,
+.cloud-layer-meter span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--cover, 0%);
+  border-radius: inherit;
+  transition: width 180ms ease;
+}
+
+.cloud-total-meter span {
+  background: linear-gradient(90deg, #eef5f0, #a6cdd7);
+}
+
+.cloud-layer-low span {
+  background: #b9d6dd;
+}
+
+.cloud-layer-mid span {
+  background: #d8d4c6;
+}
+
+.cloud-layer-high span {
+  background: #f2ebd0;
+}
+
+.cloud-layer-grid {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 36px;
+  align-items: center;
+  gap: 5px 7px;
+  color: rgba(255, 246, 210, 0.84);
+  font-size: 11px;
+}
+
+.cloud-layer-grid output {
+  text-align: right;
+  color: #fff6d2;
+}
+
 .status-pill {
   position: fixed;
   left: 16px;
-  bottom: 132px;
+  bottom: 184px;
   z-index: 10;
-  max-width: min(360px, calc(100vw - 32px));
+  max-width: min(380px, calc(100vw - 32px));
+  max-height: min(260px, calc(100vh - 36px));
+  overflow: auto;
   padding: 9px 12px;
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 8px;
@@ -331,6 +447,43 @@ select:focus-visible {
   color: #fff6d2;
   font-size: 12px;
   line-height: 1.35;
+}
+
+.status-pill.has-diagnostics {
+  border-color: rgba(241, 203, 107, 0.38);
+  background: rgba(18, 25, 21, 0.9);
+}
+
+.status-current {
+  color: rgba(255, 246, 210, 0.9);
+}
+
+.diagnostic-entry {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.diagnostic-warning {
+  color: #ffd98a;
+}
+
+.diagnostic-error {
+  color: #ffb1a1;
+}
+
+.diagnostic-info {
+  color: #c7e4ff;
+}
+
+@media (max-width: 1120px) and (min-width: 761px) {
+  .data-mode-control {
+    bottom: 132px;
+  }
+
+  .status-pill {
+    bottom: 300px;
+  }
 }
 
 dialog {
@@ -424,14 +577,14 @@ dialog::backdrop {
   .height-control {
     top: 78px;
     right: auto;
-    bottom: 230px;
+    bottom: 310px;
     left: 12px;
   }
 
   .time-control {
     grid-template-columns: repeat(3, 36px) minmax(120px, 1fr) repeat(3, 36px);
     gap: 4px;
-    bottom: 72px;
+    bottom: 232px;
   }
 
   .time-control button {
@@ -439,15 +592,29 @@ dialog::backdrop {
     padding: 0;
   }
 
+  .fov-control {
+    bottom: 176px;
+  }
+
   .mini-map-panel {
     width: 210px;
     height: 170px;
     right: 12px;
-    bottom: 126px;
+    bottom: 296px;
+  }
+
+  .data-mode-control {
+    left: 12px;
+    right: 12px;
+    bottom: 16px;
+    width: auto;
   }
 
   .status-pill {
-    display: none;
+    left: 128px;
+    bottom: 480px;
+    width: calc(100vw - 140px);
+    max-height: 140px;
   }
 
   .settings-grid {

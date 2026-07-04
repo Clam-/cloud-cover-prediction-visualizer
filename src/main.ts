@@ -16,7 +16,7 @@ import {
 } from "./geo";
 import { MiniMap } from "./miniMap";
 import { defaultSettings, loadSettings, resetSettings, saveSettings } from "./settings";
-import type { CloudSnapshot, LocationPoint, Settings, TerrainGrid } from "./types";
+import type { CloudDataMode, CloudSnapshot, LocationPoint, Settings, TerrainGrid } from "./types";
 
 interface DragState {
   pointerId: number;
@@ -28,6 +28,13 @@ interface DragState {
   moved: boolean;
 }
 
+type DiagnosticSeverity = "info" | "warning" | "error";
+
+interface DiagnosticEntry {
+  message: string;
+  severity: DiagnosticSeverity;
+}
+
 const canvas = element<HTMLCanvasElement>("scene");
 const searchForm = element<HTMLFormElement>("searchForm");
 const searchInput = element<HTMLInputElement>("searchInput");
@@ -37,7 +44,9 @@ const heightValue = element<HTMLOutputElement>("heightValue");
 const terrainHeightValue = element<HTMLButtonElement>("terrainHeightValue");
 const fovSlider = element<HTMLInputElement>("fovSlider");
 const fovValue = element<HTMLOutputElement>("fovValue");
+const timeControl = element<HTMLElement>("timeControl");
 const timeValue = element<HTMLOutputElement>("timeValue");
+const timeStepButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-hours]"));
 const statusPill = element<HTMLDivElement>("statusPill");
 const menuButton = element<HTMLButtonElement>("menuButton");
 const menuDialog = element<HTMLDialogElement>("menuDialog");
@@ -47,6 +56,18 @@ const settingsForm = element<HTMLFormElement>("settingsForm");
 const closeSettingsButton = element<HTMLButtonElement>("closeSettingsButton");
 const resetSettingsButton = element<HTMLButtonElement>("resetSettingsButton");
 const mapCenterButton = element<HTMLButtonElement>("mapCenterButton");
+const dataModeControl = element<HTMLElement>("dataModeControl");
+const realTimeModeButton = element<HTMLButtonElement>("realTimeModeButton");
+const predictionModeButton = element<HTMLButtonElement>("predictionModeButton");
+const cloudModeLabel = element<HTMLElement>("cloudModeLabel");
+const cloudTotalValue = element<HTMLOutputElement>("cloudTotalValue");
+const cloudTotalMeter = element<HTMLElement>("cloudTotalMeter");
+const cloudLowMeter = element<HTMLElement>("cloudLowMeter");
+const cloudMidMeter = element<HTMLElement>("cloudMidMeter");
+const cloudHighMeter = element<HTMLElement>("cloudHighMeter");
+const cloudLowValue = element<HTMLOutputElement>("cloudLowValue");
+const cloudMidValue = element<HTMLOutputElement>("cloudMidValue");
+const cloudHighValue = element<HTMLOutputElement>("cloudHighValue");
 
 const terrainSource = element<HTMLSelectElement>("terrainSource");
 const cloudSource = element<HTMLSelectElement>("cloudSource");
@@ -58,6 +79,7 @@ const openMeteoKey = element<HTMLInputElement>("openMeteoKey");
 const terrainScale = element<HTMLInputElement>("terrainScale");
 const HEIGHT_CENTER_SNAP_METERS = 5;
 const CLOUD_RELOAD_DEBOUNCE_MS = 500;
+const REALTIME_CLOUD_REFRESH_MS = 5 * 60 * 1000;
 
 class HorizonApp {
   private readonly renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -68,7 +90,14 @@ class HorizonApp {
   private readonly terrainGroup = new THREE.Group();
   private readonly cloudGroup = new THREE.Group();
   private readonly celestialGroup = new THREE.Group();
-  private readonly miniMap = new MiniMap(element<HTMLCanvasElement>("miniMap"), element<HTMLElement>("miniMapPanel"), element<HTMLElement>("mapAttribution"));
+  private readonly diagnostics = new Map<string, DiagnosticEntry>();
+  private statusMessage = "Loading";
+  private readonly miniMap = new MiniMap(
+    element<HTMLCanvasElement>("miniMap"),
+    element<HTMLElement>("miniMapPanel"),
+    element<HTMLElement>("mapAttribution"),
+    (message) => this.updateDiagnostic("map-raster", message ? { message, severity: "warning" } : undefined)
+  );
   private readonly timer = new THREE.Timer();
   private readonly sunLight = new THREE.DirectionalLight("#fff3c2", 1.4);
   private readonly ambient = new THREE.HemisphereLight("#bcd7ff", "#344c32", 0.62);
@@ -85,9 +114,11 @@ class HorizonApp {
   private fov = 70;
   private heightOffset = 2;
   private time = roundToHour(new Date());
+  private cloudMode: CloudDataMode = "prediction";
   private loadId = 0;
   private cloudReloadId = 0;
   private cloudReloadTimer?: number;
+  private realtimeRefreshTimer?: number;
   private cloudTexture?: THREE.Texture;
   private terrainAbort?: AbortController;
   private cloudAbort?: AbortController;
@@ -99,6 +130,8 @@ class HorizonApp {
     this.configureScene();
     this.bindUi();
     this.populateSettingsForm();
+    this.updateConfigurationDiagnostics();
+    this.updateDataModeUi();
     this.updateHud();
     this.location = await this.detectInitialLocation();
     await this.warpTo(this.location, true);
@@ -161,14 +194,20 @@ class HorizonApp {
       this.updateHud();
     });
 
-    document.querySelectorAll<HTMLButtonElement>("[data-hours]").forEach((button) => {
+    timeStepButtons.forEach((button) => {
       button.addEventListener("click", () => {
+        if (this.cloudMode === "realtime") {
+          return;
+        }
         this.time = addHours(this.time, Number(button.dataset.hours));
         this.updateHud();
         this.updateSky();
         this.scheduleCloudReload();
       });
     });
+
+    realTimeModeButton.addEventListener("click", () => this.setCloudMode("realtime"));
+    predictionModeButton.addEventListener("click", () => this.setCloudMode("prediction"));
 
     menuButton.addEventListener("click", () => {
       menuDialog.showModal();
@@ -183,6 +222,7 @@ class HorizonApp {
     resetSettingsButton.addEventListener("click", () => {
       this.settings = resetSettings();
       this.populateSettingsForm();
+      this.updateConfigurationDiagnostics();
       void this.warpTo(this.location, false);
     });
     settingsForm.addEventListener("submit", (event) => {
@@ -190,6 +230,7 @@ class HorizonApp {
       this.settings = this.readSettingsForm();
       saveSettings(this.settings);
       settingsDialog.close();
+      this.updateConfigurationDiagnostics();
       this.updateStatus("Reloading data sources");
       void this.warpTo(this.location, false);
     });
@@ -235,7 +276,15 @@ class HorizonApp {
           };
         }
       }
+      this.updateDiagnostic("location-service", {
+        message: "IP location service issue: using the default location.",
+        severity: "warning"
+      });
     } catch {
+      this.updateDiagnostic("location-service", {
+        message: "IP location service issue: using the default location.",
+        severity: "warning"
+      });
       return DEFAULT_LOCATION;
     }
 
@@ -255,6 +304,7 @@ class HorizonApp {
 
     try {
       const results = await searchLocations(query, this.settings, this.location, this.searchAbort.signal);
+      this.updateDiagnostic("search-service", undefined);
       if (!results.length) {
         this.updateStatus("No location results");
         return;
@@ -280,7 +330,12 @@ class HorizonApp {
       if (error instanceof DOMException && error.name === "AbortError") {
         return;
       }
-      this.updateStatus(error instanceof Error ? error.message : "Search failed");
+      const message = error instanceof Error ? error.message : "Search failed";
+      this.updateDiagnostic("search-service", {
+        message: `Search service issue: ${message}`,
+        severity: "warning"
+      });
+      this.updateStatus(message);
     }
   }
 
@@ -302,21 +357,34 @@ class HorizonApp {
       this.pitch = 0;
     }
     searchInput.value = location.label;
+    if (this.cloudMode === "realtime") {
+      this.time = new Date();
+    }
+    const requestedCloudMode = this.cloudMode;
+    const requestedCloudTime = this.time;
     this.updateHud();
     this.updateStatus(`Loading ${location.label}`);
+    this.updateDiagnostic("terrain-service", undefined);
+    this.updateDiagnostic("cloud-service", undefined);
+    this.updateDiagnostic("load-service", undefined);
 
     let terrain: TerrainGrid;
     let clouds: CloudSnapshot;
     try {
       [terrain, clouds] = await Promise.all([
         loadTerrainGrid(location, this.settings, terrainController.signal),
-        loadCloudSnapshot(location, this.time, this.settings, cloudController.signal)
+        loadCloudSnapshot(location, requestedCloudTime, this.settings, cloudController.signal, requestedCloudMode)
       ]);
     } catch (error) {
       if (terrainController.signal.aborted || cloudController.signal.aborted || isAbortError(error)) {
         return;
       }
-      this.updateStatus(errorMessage(error, "Loading location failed"));
+      const message = errorMessage(error, "Loading location failed");
+      this.updateDiagnostic("load-service", {
+        message,
+        severity: "error"
+      });
+      this.updateStatus(message);
       return;
     }
 
@@ -326,7 +394,7 @@ class HorizonApp {
 
     this.terrain = terrain;
     this.buildTerrainMesh(terrain);
-    if (clouds.time.getTime() === this.time.getTime()) {
+    if (requestedCloudMode === this.cloudMode && clouds.time.getTime() === requestedCloudTime.getTime()) {
       this.clouds = clouds;
       this.buildClouds(clouds);
     }
@@ -334,6 +402,7 @@ class HorizonApp {
     this.updateSky();
     this.updateCamera();
     this.updateMiniMap();
+    this.updateLoadedDataDiagnostics();
     this.updateStatus(this.statusText());
   }
 
@@ -363,23 +432,43 @@ class HorizonApp {
     const controller = new AbortController();
     this.cloudReloadAbort = controller;
     const id = this.loadId;
+    if (this.cloudMode === "realtime") {
+      this.time = new Date();
+      this.updateHud();
+      this.updateSky();
+    }
     const requestedTime = this.time;
+    const requestedMode = this.cloudMode;
     this.updateStatus("Loading cloud data");
+    this.updateDiagnostic("cloud-service", undefined);
     try {
-      const clouds = await loadCloudSnapshot(this.location, requestedTime, this.settings, controller.signal);
-      if (id !== this.loadId || requestId !== this.cloudReloadId || controller.signal.aborted || clouds.time.getTime() !== this.time.getTime()) {
+      const clouds = await loadCloudSnapshot(this.location, requestedTime, this.settings, controller.signal, requestedMode);
+      if (
+        id !== this.loadId ||
+        requestId !== this.cloudReloadId ||
+        controller.signal.aborted ||
+        requestedMode !== this.cloudMode ||
+        clouds.time.getTime() !== this.time.getTime()
+      ) {
         return;
       }
       this.clouds = clouds;
       this.buildClouds(clouds);
+      this.updateHud();
       this.updateSky();
+      this.updateCloudDiagnostics(clouds);
       this.updateStatus(this.statusText());
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
         return;
       }
       if (id === this.loadId && requestId === this.cloudReloadId) {
-        this.updateStatus(errorMessage(error, "Loading cloud data failed"));
+        const message = errorMessage(error, "Loading cloud data failed");
+        this.updateDiagnostic("cloud-service", {
+          message: `Cloud service issue: ${message}`,
+          severity: "warning"
+        });
+        this.updateStatus(message);
       }
     } finally {
       if (this.cloudReloadAbort === controller) {
@@ -476,7 +565,8 @@ class HorizonApp {
 
     for (const layer of layers) {
       const random = seededRandom(`${this.location.lat.toFixed(2)}:${this.location.lon.toFixed(2)}:${snapshot.time.toISOString()}:${layer.name}`);
-      const count = Math.round((layer.cover / 100) * layer.max);
+      const modeDensity = snapshot.dataMode === "realtime" ? 1.18 : 1;
+      const count = Math.round((layer.cover / 100) * layer.max * modeDensity);
       for (let i = 0; i < count; i += 1) {
         const angle = random() * Math.PI * 2;
         const radius = 9000 + random() * 46000;
@@ -669,6 +759,60 @@ class HorizonApp {
     this.miniMap.update(this.terrain, this.location, this.yaw, this.settings);
   }
 
+  private setCloudMode(mode: CloudDataMode): void {
+    const previousMode = this.cloudMode;
+    if (mode === "realtime") {
+      this.time = new Date();
+    } else if (previousMode === "realtime") {
+      this.time = roundToHour(this.time);
+    }
+
+    this.cloudMode = mode;
+    if (mode !== previousMode) {
+      this.clouds = undefined;
+      this.disposeGroupChildren(this.cloudGroup);
+    }
+    this.updateDataModeUi();
+    this.updateHud();
+    this.updateSky();
+    this.configureRealtimeRefresh();
+
+    if (mode !== previousMode || mode === "realtime") {
+      this.scheduleCloudReload();
+    }
+  }
+
+  private configureRealtimeRefresh(): void {
+    if (this.realtimeRefreshTimer !== undefined) {
+      window.clearInterval(this.realtimeRefreshTimer);
+      this.realtimeRefreshTimer = undefined;
+    }
+    if (this.cloudMode !== "realtime") {
+      return;
+    }
+    this.realtimeRefreshTimer = window.setInterval(() => {
+      if (this.cloudMode !== "realtime") {
+        return;
+      }
+      this.time = new Date();
+      this.updateHud();
+      this.updateSky();
+      this.scheduleCloudReload();
+    }, REALTIME_CLOUD_REFRESH_MS);
+  }
+
+  private updateDataModeUi(): void {
+    const realtime = this.cloudMode === "realtime";
+    dataModeControl.dataset.mode = this.cloudMode;
+    realTimeModeButton.setAttribute("aria-pressed", String(realtime));
+    predictionModeButton.setAttribute("aria-pressed", String(!realtime));
+    timeControl.classList.toggle("is-live-time", realtime);
+    timeStepButtons.forEach((button) => {
+      button.disabled = realtime;
+    });
+    cloudModeLabel.textContent = realtime ? "Real-time" : "Prediction";
+  }
+
   private updateHud(): void {
     const terrainHeight = Math.round(this.terrain?.groundElevation ?? 0);
     const relativeHeight = Math.round(this.heightOffset);
@@ -676,9 +820,26 @@ class HorizonApp {
     heightValue.textContent = `${absoluteHeight} m\n(${formatSignedMeters(relativeHeight)})`;
     terrainHeightValue.textContent = `${terrainHeight} m`;
     fovValue.textContent = `${Math.round(this.fov)} deg`;
-    timeValue.textContent = formatTime(this.time);
+    timeValue.textContent = this.cloudMode === "realtime" ? `Now · ${formatTime(this.time)}` : formatTime(this.time);
     heightSlider.value = String(this.heightOffset);
     fovSlider.value = String(this.fov);
+    this.updateCloudReadout();
+  }
+
+  private updateCloudReadout(): void {
+    const total = this.clouds?.total ?? 0;
+    const low = this.clouds?.low ?? 0;
+    const mid = this.clouds?.mid ?? 0;
+    const high = this.clouds?.high ?? 0;
+
+    cloudTotalValue.textContent = this.clouds ? `${total}%` : "--%";
+    cloudLowValue.textContent = this.clouds ? `${low}%` : "--%";
+    cloudMidValue.textContent = this.clouds ? `${mid}%` : "--%";
+    cloudHighValue.textContent = this.clouds ? `${high}%` : "--%";
+    setMeter(cloudTotalMeter, total, this.clouds !== undefined);
+    setMeter(cloudLowMeter, low, this.clouds !== undefined);
+    setMeter(cloudMidMeter, mid, this.clouds !== undefined);
+    setMeter(cloudHighMeter, high, this.clouds !== undefined);
   }
 
   private snapHeightOffset(value: number, force = false): number {
@@ -690,7 +851,104 @@ class HorizonApp {
   }
 
   private updateStatus(message: string): void {
-    statusPill.textContent = message;
+    this.statusMessage = message;
+    this.renderDiagnostics();
+  }
+
+  private updateDiagnostic(id: string, entry: DiagnosticEntry | undefined): void {
+    if (entry) {
+      this.diagnostics.set(id, entry);
+    } else {
+      this.diagnostics.delete(id);
+    }
+    this.renderDiagnostics();
+  }
+
+  private renderDiagnostics(): void {
+    statusPill.replaceChildren();
+    statusPill.classList.toggle("has-diagnostics", this.diagnostics.size > 0);
+
+    const current = document.createElement("div");
+    current.className = "status-current";
+    current.textContent = this.statusMessage;
+    statusPill.append(current);
+
+    for (const diagnostic of this.diagnostics.values()) {
+      const row = document.createElement("div");
+      row.className = `diagnostic-entry diagnostic-${diagnostic.severity}`;
+      row.textContent = diagnostic.message;
+      statusPill.append(row);
+    }
+  }
+
+  private updateConfigurationDiagnostics(): void {
+    const mapboxKeyMissing = !this.settings.apiKeys.mapbox.trim();
+    const openWeatherKeyMissing = !this.settings.apiKeys.openWeather.trim();
+
+    this.updateDiagnostic(
+      "config-mapbox-terrain",
+      this.settings.terrainSource === "mapbox" && mapboxKeyMissing
+        ? {
+            message: "Mapbox terrain needs a Mapbox token in Settings.",
+            severity: "warning"
+          }
+        : undefined
+    );
+    this.updateDiagnostic(
+      "config-mapbox-geocoder",
+      this.settings.geocoderSource === "mapbox" && mapboxKeyMissing
+        ? {
+            message: "Mapbox geocoding needs a Mapbox token in Settings.",
+            severity: "warning"
+          }
+        : undefined
+    );
+    this.updateDiagnostic(
+      "config-mapbox-map",
+      this.settings.mapSource === "mapboxRaster" && mapboxKeyMissing
+        ? {
+            message: "Mapbox map tiles need a Mapbox token in Settings.",
+            severity: "warning"
+          }
+        : undefined
+    );
+    this.updateDiagnostic(
+      "config-openweather-clouds",
+      this.settings.cloudSource === "openWeather" && openWeatherKeyMissing
+        ? {
+            message: "OpenWeather clouds need an API key in Settings.",
+            severity: "warning"
+          }
+        : undefined
+    );
+  }
+
+  private updateLoadedDataDiagnostics(): void {
+    if (this.terrain?.warning) {
+      this.updateDiagnostic("terrain-service", {
+        message: `Terrain service issue: ${this.terrain.warning}; using synthetic terrain.`,
+        severity: "warning"
+      });
+    } else {
+      this.updateDiagnostic("terrain-service", undefined);
+    }
+
+    if (this.clouds) {
+      this.updateCloudDiagnostics(this.clouds);
+    }
+  }
+
+  private updateCloudDiagnostics(clouds: CloudSnapshot): void {
+    const fallbackMode = clouds.dataMode === "realtime" ? "real-time data" : "forecast";
+    this.updateDiagnostic(
+      "cloud-service",
+      clouds.warning
+        ? {
+            message: `Cloud service issue: ${clouds.warning}; using synthetic ${fallbackMode}.`,
+            severity: "warning"
+          }
+        : undefined
+    );
   }
 
   private statusText(): string {
@@ -700,8 +958,7 @@ class HorizonApp {
       `${this.clouds?.sourceLabel ?? "Clouds"} ${this.clouds?.total ?? 0}%`,
       `View ${Math.round(radiansToDegrees(this.yaw) + 360) % 360} deg`
     ];
-    const warning = this.terrain?.warning ?? this.clouds?.warning;
-    return warning ? `${parts.join(" | ")} | ${warning}` : parts.join(" | ");
+    return parts.join(" | ");
   }
 
   private populateSettingsForm(): void {
@@ -754,6 +1011,12 @@ function element<T extends HTMLElement>(id: string): T {
     throw new Error(`Missing element #${id}`);
   }
   return node as T;
+}
+
+function setMeter(element: HTMLElement, value: number, hasData: boolean): void {
+  const cover = hasData ? clamp(value, 0, 100) : 0;
+  element.style.setProperty("--cover", `${cover}%`);
+  element.setAttribute("aria-valuenow", String(cover));
 }
 
 function formatSignedMeters(value: number): string {

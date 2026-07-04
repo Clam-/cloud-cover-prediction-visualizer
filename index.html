@@ -55,7 +55,41 @@
         <div id="mapAttribution" class="map-attribution"></div>
       </section>
 
-      <div id="statusPill" class="status-pill">Loading</div>
+      <section id="dataModeControl" class="data-mode-control" aria-label="Cloud data mode">
+        <div class="data-mode-toggle" role="group" aria-label="Cloud data mode">
+          <button id="realTimeModeButton" type="button" aria-pressed="false">Real-time</button>
+          <button id="predictionModeButton" type="button" aria-pressed="true">Prediction</button>
+        </div>
+
+        <div class="cloud-readout" aria-label="Cloud cover">
+          <div class="cloud-readout-header">
+            <span id="cloudModeLabel">Prediction</span>
+            <output id="cloudTotalValue">--%</output>
+          </div>
+          <div id="cloudTotalMeter" class="cloud-total-meter" role="meter" aria-label="Total cloud cover" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span></span>
+          </div>
+          <div class="cloud-layer-grid">
+            <span>Low</span>
+            <div id="cloudLowMeter" class="cloud-layer-meter cloud-layer-low" role="meter" aria-label="Low cloud cover" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span></span>
+            </div>
+            <output id="cloudLowValue">--%</output>
+            <span>Mid</span>
+            <div id="cloudMidMeter" class="cloud-layer-meter cloud-layer-mid" role="meter" aria-label="Mid cloud cover" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span></span>
+            </div>
+            <output id="cloudMidValue">--%</output>
+            <span>High</span>
+            <div id="cloudHighMeter" class="cloud-layer-meter cloud-layer-high" role="meter" aria-label="High cloud cover" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span></span>
+            </div>
+            <output id="cloudHighValue">--%</output>
+          </div>
+        </div>
+      </section>
+
+      <div id="statusPill" class="status-pill" role="status" aria-live="polite">Loading</div>
     </main>
 
     <dialog id="menuDialog" class="menu-dialog">

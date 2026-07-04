@@ -19,7 +19,12 @@ export class MiniMap {
   private resizeObserver: ResizeObserver;
   private zoomOffset = 0;
 
-  constructor(private readonly canvas: HTMLCanvasElement, private readonly panel: HTMLElement, attribution: HTMLElement) {
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly panel: HTMLElement,
+    attribution: HTMLElement,
+    private readonly reportRasterIssue?: (message?: string) => void
+  ) {
     const context = canvas.getContext("2d");
     if (!context) {
       throw new Error("Unable to create mini map canvas");
@@ -84,12 +89,14 @@ export class MiniMap {
   private drawRasterBackground(source: MapSource, width: number, height: number): boolean {
     if (!this.location || !this.settings || source === "terrainCanvas") {
       this.attribution.textContent = "";
+      this.reportRasterIssue?.();
       return false;
     }
 
     const isMapbox = source === "mapboxRaster";
     if (isMapbox && !this.settings.apiKeys.mapbox.trim()) {
       this.attribution.textContent = "Mapbox token missing";
+      this.reportRasterIssue?.("Mapbox map tiles need a Mapbox token in Settings.");
       return false;
     }
 
@@ -220,10 +227,12 @@ export class MiniMap {
     tile.image.crossOrigin = "anonymous";
     tile.image.onload = () => {
       tile.ready = true;
+      this.reportRasterIssue?.();
       this.draw();
     };
     tile.image.onerror = () => {
       tile.ready = false;
+      this.reportRasterIssue?.(`${source === "mapboxRaster" ? "Mapbox" : "OpenStreetMap"} map tile service issue: map tiles could not load.`);
       if (rasterCache.get(key) === tile) {
         rasterCache.delete(key);
       }
