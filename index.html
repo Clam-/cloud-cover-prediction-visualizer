@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cloud Cover Horizon Visualizer</title>
+  </head>
+  <body>
+    <main id="app">
+      <canvas id="scene"></canvas>
+
+      <button id="menuButton" class="icon-button menu-button" type="button" aria-label="Open menu">
+        <span class="hamburger-line"></span>
+        <span class="hamburger-line"></span>
+        <span class="hamburger-line"></span>
+      </button>
+
+      <form id="searchForm" class="search-shell" autocomplete="off">
+        <input id="searchInput" name="location" type="search" placeholder="Search location" aria-label="Search location" />
+        <button id="searchButton" type="submit">Warp</button>
+        <div id="searchResults" class="search-results" hidden></div>
+      </form>
+
+      <section id="heightControl" class="height-control" aria-label="Height offset">
+        <output id="heightValue">2 m</output>
+        <div class="height-gauge">
+          <button id="terrainHeightValue" class="terrain-height-value" type="button" aria-label="Reset height offset to terrain height">0 m</button>
+          <input id="heightSlider" type="range" min="-300" max="300" step="1" value="2" orient="vertical" aria-label="Height offset" />
+        </div>
+        <span>Height</span>
+      </section>
+
+      <section id="timeControl" class="time-control" aria-label="Visualized time">
+        <button type="button" data-hours="-6">-6</button>
+        <button type="button" data-hours="-3">-3</button>
+        <button type="button" data-hours="-1">&lt;</button>
+        <output id="timeValue"></output>
+        <button type="button" data-hours="1">&gt;</button>
+        <button type="button" data-hours="3">+3</button>
+        <button type="button" data-hours="6">+6</button>
+      </section>
+
+      <section id="fovControl" class="fov-control" aria-label="Field of view">
+        <span>FOV</span>
+        <input id="fovSlider" type="range" min="35" max="110" step="1" value="70" aria-label="Field of view" />
+        <output id="fovValue">70 deg</output>
+      </section>
+
+      <section id="miniMapPanel" class="mini-map-panel" aria-label="Top down map">
+        <header>
+          <span>Map</span>
+          <button id="mapCenterButton" type="button">POV</button>
+        </header>
+        <canvas id="miniMap"></canvas>
+        <div id="mapAttribution" class="map-attribution"></div>
+      </section>
+
+      <div id="statusPill" class="status-pill">Loading</div>
+    </main>
+
+    <dialog id="menuDialog" class="menu-dialog">
+      <form method="dialog">
+        <button id="settingsButton" value="settings" type="submit">Settings</button>
+      </form>
+    </dialog>
+
+    <dialog id="settingsDialog" class="settings-dialog">
+      <form id="settingsForm">
+        <header>
+          <h1>Settings</h1>
+          <button id="closeSettingsButton" type="button" aria-label="Close settings">x</button>
+        </header>
+
+        <div class="settings-grid">
+          <label>
+            Terrain data
+            <select id="terrainSource" name="terrainSource">
+              <option value="synthetic">Synthetic terrain</option>
+              <option value="openMeteo">Open-Meteo Elevation</option>
+              <option value="mapbox">Mapbox Terrain-RGB</option>
+            </select>
+          </label>
+
+          <label>
+            Cloud data
+            <select id="cloudSource" name="cloudSource">
+              <option value="synthetic">Synthetic forecast</option>
+              <option value="openMeteo">Open-Meteo Forecast</option>
+              <option value="openWeather">OpenWeather One Call</option>
+            </select>
+          </label>
+
+          <label>
+            Search data
+            <select id="geocoderSource" name="geocoderSource">
+              <option value="openMeteo">Open-Meteo Geocoding</option>
+              <option value="nominatim">Nominatim</option>
+              <option value="mapbox">Mapbox Geocoding</option>
+            </select>
+          </label>
+
+          <label>
+            Map data
+            <select id="mapSource" name="mapSource">
+              <option value="terrainCanvas">Terrain canvas</option>
+              <option value="osmRaster">OpenStreetMap raster</option>
+              <option value="mapboxRaster">Mapbox Outdoors raster</option>
+            </select>
+          </label>
+
+          <label>
+            Mapbox token
+            <input id="mapboxToken" name="mapboxToken" type="password" autocomplete="off" />
+          </label>
+
+          <label>
+            OpenWeather key
+            <input id="openWeatherKey" name="openWeatherKey" type="password" autocomplete="off" />
+          </label>
+
+          <label>
+            Open-Meteo key
+            <input id="openMeteoKey" name="openMeteoKey" type="password" autocomplete="off" />
+          </label>
+
+          <label>
+            Terrain vertical scale
+            <input id="terrainScale" name="terrainScale" type="number" min="0.5" max="3" step="0.1" />
+          </label>
+        </div>
+
+        <footer>
+          <button id="resetSettingsButton" type="button">Reset</button>
+          <button type="submit">Save</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
