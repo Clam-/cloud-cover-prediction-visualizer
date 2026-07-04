@@ -8,6 +8,8 @@ import {
   addHours,
   clamp,
   DEFAULT_LOCATION,
+  degreesToRadians,
+  formatCoordinate,
   formatTime,
   offsetLocation,
   radiansToDegrees,
@@ -15,6 +17,7 @@ import {
   seededRandom
 } from "./geo";
 import { MiniMap } from "./miniMap";
+import { PanoramaRenderer } from "./panorama";
 import { defaultSettings, loadSettings, resetSettings, saveSettings } from "./settings";
 import type { CloudDataMode, CloudSnapshot, LocationPoint, Settings, TerrainGrid } from "./types";
 
@@ -35,7 +38,16 @@ interface DiagnosticEntry {
   severity: DiagnosticSeverity;
 }
 
+interface InitialRoute {
+  eyeElevation?: number;
+  fov?: number;
+  location: LocationPoint;
+  pitch?: number;
+  yaw?: number;
+}
+
 const canvas = element<HTMLCanvasElement>("scene");
+const panoramaCanvas = element<HTMLCanvasElement>("terrainPanorama");
 const searchForm = element<HTMLFormElement>("searchForm");
 const searchInput = element<HTMLInputElement>("searchInput");
 const searchResults = element<HTMLDivElement>("searchResults");
@@ -90,6 +102,7 @@ class HorizonApp {
   private readonly terrainGroup = new THREE.Group();
   private readonly cloudGroup = new THREE.Group();
   private readonly celestialGroup = new THREE.Group();
+  private readonly panorama = new PanoramaRenderer(panoramaCanvas);
   private readonly diagnostics = new Map<string, DiagnosticEntry>();
   private statusMessage = "Loading";
   private readonly miniMap = new MiniMap(
@@ -124,6 +137,7 @@ class HorizonApp {
   private cloudAbort?: AbortController;
   private cloudReloadAbort?: AbortController;
   private searchAbort?: AbortController;
+  private pendingEyeElevation?: number;
 
   async start(): Promise<void> {
     this.configureRenderer();
@@ -133,8 +147,14 @@ class HorizonApp {
     this.updateConfigurationDiagnostics();
     this.updateDataModeUi();
     this.updateHud();
-    this.location = await this.detectInitialLocation();
-    await this.warpTo(this.location, true);
+    const initialRoute = this.readInitialRoute();
+    if (initialRoute) {
+      this.applyInitialRoute(initialRoute);
+      await this.warpTo(initialRoute.location, false);
+    } else {
+      this.location = await this.detectInitialLocation();
+      await this.warpTo(this.location, true);
+    }
     this.animate();
   }
 
@@ -155,6 +175,48 @@ class HorizonApp {
     this.scene.add(this.celestialGroup);
     this.scene.add(this.ambient);
     this.scene.add(this.sunLight);
+  }
+
+  private readInitialRoute(): InitialRoute | undefined {
+    const params = new URLSearchParams(window.location.search);
+    const lat = readFiniteParam(params, "lat");
+    const lon = readFiniteParam(params, "lng") ?? readFiniteParam(params, "lon");
+    if (lat === undefined || lon === undefined || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+      return undefined;
+    }
+
+    const name = params.get("name")?.trim();
+    const elevation = readFiniteParam(params, "ele");
+    const azi = readFiniteParam(params, "azi");
+    const alt = readFiniteParam(params, "alt");
+    const fov = readFiniteParam(params, "fov");
+
+    return {
+      eyeElevation: elevation,
+      fov: fov === undefined ? undefined : clamp(fov, 35, 110),
+      location: {
+        lat,
+        lon,
+        elevation,
+        label: name || `${formatCoordinate(lat, "lat")}, ${formatCoordinate(lon, "lon")}`
+      },
+      pitch: alt === undefined ? undefined : clamp(degreesToRadians(alt), -1.32, 1.32),
+      yaw: azi === undefined ? undefined : degreesToRadians(((azi % 360) + 360) % 360)
+    };
+  }
+
+  private applyInitialRoute(route: InitialRoute): void {
+    this.location = route.location;
+    if (route.yaw !== undefined) {
+      this.yaw = route.yaw;
+    }
+    if (route.pitch !== undefined) {
+      this.pitch = route.pitch;
+    }
+    if (route.fov !== undefined) {
+      this.fov = route.fov;
+    }
+    this.pendingEyeElevation = route.eyeElevation;
   }
 
   private bindUi(): void {
@@ -392,6 +454,10 @@ class HorizonApp {
       return;
     }
 
+    if (this.pendingEyeElevation !== undefined) {
+      this.heightOffset = this.snapHeightOffset(this.pendingEyeElevation - terrain.groundElevation, true);
+      this.pendingEyeElevation = undefined;
+    }
     this.terrain = terrain;
     this.buildTerrainMesh(terrain);
     if (requestedCloudMode === this.cloudMode && clouds.time.getTime() === requestedCloudTime.getTime()) {
@@ -552,7 +618,11 @@ class HorizonApp {
     this.seaMesh = new THREE.Mesh(seaGeometry, seaMaterial);
     this.seaMesh.rotation.x = -Math.PI / 2;
     this.seaMesh.position.y = (0 - grid.groundElevation) * this.settings.terrainVerticalScale - 0.8;
+    material.colorWrite = false;
+    material.depthWrite = false;
+    this.seaMesh.visible = false;
     this.terrainGroup.add(this.seaMesh);
+    this.renderPanorama();
   }
 
   private buildClouds(snapshot: CloudSnapshot): void {
@@ -753,6 +823,7 @@ class HorizonApp {
     const direction = new THREE.Vector3(Math.sin(this.yaw) * Math.cos(this.pitch), Math.sin(this.pitch), Math.cos(this.yaw) * Math.cos(this.pitch));
     this.camera.lookAt(this.camera.position.clone().add(direction));
     this.camera.updateProjectionMatrix();
+    this.renderPanorama();
   }
 
   private updateMiniMap(): void {
@@ -992,6 +1063,17 @@ class HorizonApp {
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
+    this.renderPanorama();
+  }
+
+  private renderPanorama(): void {
+    this.panorama.render(this.terrain, {
+      fov: this.fov,
+      heightOffset: this.heightOffset,
+      pitch: this.pitch,
+      verticalScale: this.settings.terrainVerticalScale,
+      yaw: this.yaw
+    });
   }
 
   private animate = (timestamp?: number): void => {
@@ -1021,6 +1103,15 @@ function setMeter(element: HTMLElement, value: number, hasData: boolean): void {
 
 function formatSignedMeters(value: number): string {
   return `${value >= 0 ? "+" : ""}${value} m`;
+}
+
+function readFiniteParam(params: URLSearchParams, name: string): number | undefined {
+  const raw = params.get(name);
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
 }
 
 function isAbortError(error: unknown): boolean {

@@ -57,6 +57,16 @@ select:focus-visible {
   background: #223644;
 }
 
+#terrainPanorama {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
 .icon-button {
   width: 42px;
   height: 42px;
