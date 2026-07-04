@@ -254,6 +254,7 @@ class HorizonApp {
       this.camera.fov = this.fov;
       this.camera.updateProjectionMatrix();
       this.updateHud();
+      this.renderPanorama();
     });
 
     timeStepButtons.forEach((button) => {

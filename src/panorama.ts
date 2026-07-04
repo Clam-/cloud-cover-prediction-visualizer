@@ -30,6 +30,11 @@ interface ProjectedPoint {
 
 type ProfilePoint = ProjectedPoint | undefined;
 
+interface ProfileSegment {
+  startIndex: number;
+  points: ProjectedPoint[];
+}
+
 const EARTH_RADIUS_METERS = 6371008.8;
 const REFRACTION_COEFFICIENT = 0.13;
 const MIN_SAMPLE_DISTANCE_METERS = 220;
@@ -122,11 +127,11 @@ export class PanoramaRenderer {
 
         const bearing = Math.atan2(sample.east, sample.north);
         const angleOffset = wrapRadians(bearing - options.yaw);
-        if (Math.abs(angleOffset) > projection.halfFov + projection.margin) {
+        if (Math.abs(angleOffset) > projection.halfHorizontalFov) {
           continue;
         }
 
-        const column = Math.round(((angleOffset + projection.halfFov) / projection.fovRadians) * (columnCount - 1));
+        const column = Math.round(((angleOffset + projection.halfHorizontalFov) / projection.horizontalFov) * (columnCount - 1));
         if (column < 0 || column >= columnCount) {
           continue;
         }
@@ -162,8 +167,7 @@ export class PanoramaRenderer {
       drawTerrainBand(context, profile, TERRAIN_BANDS[index], width, height);
     });
 
-    const smoothSkyline = smoothProfile(interpolateProfile(skyline), 1);
-    drawSkyline(context, smoothSkyline, width);
+    drawSkyline(context, interpolateProfile(skyline), width);
   }
 
   private resize(): void {
@@ -189,21 +193,19 @@ export class PanoramaRenderer {
 
 function createProjection(width: number, height: number, options: PanoramaOptions): {
   focalY: number;
-  fovRadians: number;
-  halfFov: number;
+  halfHorizontalFov: number;
   height: number;
-  margin: number;
+  horizontalFov: number;
   pitch: number;
   width: number;
 } {
-  const fovRadians = (options.fov * Math.PI) / 180;
-  const verticalFov = 2 * Math.atan(Math.tan(fovRadians / 2) / (width / height));
+  const verticalFov = (options.fov * Math.PI) / 180;
+  const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * (width / height));
   return {
     focalY: height / (2 * Math.tan(verticalFov / 2)),
-    fovRadians,
-    halfFov: fovRadians / 2,
+    halfHorizontalFov: horizontalFov / 2,
     height,
-    margin: fovRadians * 0.1,
+    horizontalFov,
     pitch: options.pitch,
     width
   };
@@ -216,7 +218,7 @@ function altitudeToY(
   return projection.height / 2 - Math.tan(altitude - projection.pitch) * projection.focalY;
 }
 
-function interpolateProfile(profile: ProfilePoint[]): ProjectedPoint[] {
+function interpolateProfile(profile: ProfilePoint[]): ProfilePoint[] {
   const validIndices = profile.reduce<number[]>((indices, point, index) => {
     if (point) {
       indices.push(index);
@@ -228,11 +230,13 @@ function interpolateProfile(profile: ProfilePoint[]): ProjectedPoint[] {
     return [];
   }
 
-  const interpolated: ProjectedPoint[] = new Array(profile.length);
+  const interpolated: ProfilePoint[] = new Array(profile.length);
   let nextValidPointer = 0;
   let previousIndex = validIndices[0];
+  const firstValidIndex = validIndices[0];
+  const lastValidIndex = validIndices[validIndices.length - 1];
 
-  for (let index = 0; index < profile.length; index += 1) {
+  for (let index = firstValidIndex; index <= lastValidIndex; index += 1) {
     const point = profile[index];
     if (point) {
       interpolated[index] = { ...point };
@@ -265,12 +269,17 @@ function mixProjectedPoint(a: ProjectedPoint, b: ProjectedPoint, t: number): Pro
   };
 }
 
-function smoothProfile(profile: ProjectedPoint[], passes: number): ProjectedPoint[] {
+function smoothProfile(profile: ProfilePoint[], passes: number): ProfilePoint[] {
   let current = profile;
   for (let pass = 0; pass < passes; pass += 1) {
-    current = current.map((point, index) => {
-      const previous = current[Math.max(0, index - 1)];
-      const next = current[Math.min(current.length - 1, index + 1)];
+    current = Array.from({ length: current.length }, (_, index) => {
+      const point = current[index];
+      if (!point) {
+        return undefined;
+      }
+
+      const previous = current[index - 1] ?? point;
+      const next = current[index + 1] ?? point;
       return {
         ...point,
         altitude: (previous.altitude + point.altitude * 2 + next.altitude) / 4,
@@ -281,6 +290,30 @@ function smoothProfile(profile: ProjectedPoint[], passes: number): ProjectedPoin
     });
   }
   return current;
+}
+
+function profileSegments(profile: ProfilePoint[]): ProfileSegment[] {
+  const segments: ProfileSegment[] = [];
+  let active: ProfileSegment | undefined;
+
+  for (let index = 0; index < profile.length; index += 1) {
+    const point = profile[index];
+    if (!point) {
+      active = undefined;
+      continue;
+    }
+
+    if (!active) {
+      active = {
+        startIndex: index,
+        points: []
+      };
+      segments.push(active);
+    }
+    active.points.push(point);
+  }
+
+  return segments;
 }
 
 function drawHorizon(context: CanvasRenderingContext2D, width: number, y: number): void {
@@ -296,7 +329,7 @@ function drawHorizon(context: CanvasRenderingContext2D, width: number, y: number
 
 function drawTerrainBand(
   context: CanvasRenderingContext2D,
-  profile: ProjectedPoint[],
+  profile: ProfilePoint[],
   band: TerrainBand,
   width: number,
   height: number
@@ -307,57 +340,66 @@ function drawTerrainBand(
 
   context.save();
   const step = width / Math.max(1, profile.length - 1);
-  context.beginPath();
-  context.moveTo(0, height + 8);
-  profile.forEach((point, index) => {
-    context.lineTo(index * step, clamp(point.y, -height, height + 80));
-  });
-  context.lineTo(width, height + 8);
-  context.closePath();
-  context.fillStyle = band.fill;
-  context.fill();
 
-  context.save();
-  context.clip();
-  context.strokeStyle = band.hatch;
-  context.lineWidth = 1;
-  const diagonalExtent = height * 0.52;
-  for (let x = -height; x < width + height; x += band.hatchGap) {
-    context.beginPath();
-    context.moveTo(x, height + 4);
-    context.lineTo(x + diagonalExtent, height * 0.32);
-    context.stroke();
-  }
-  context.restore();
-
-  context.strokeStyle = band.stroke;
-  context.lineWidth = band.lineWidth;
-  context.lineJoin = "round";
-  context.lineCap = "round";
-  context.beginPath();
-  profile.forEach((point, index) => {
-    const x = index * step;
-    const y = clamp(point.y, -height, height + 80);
-    if (index === 0) {
-      context.moveTo(x, y);
-    } else {
-      context.lineTo(x, y);
+  for (const segment of profileSegments(profile)) {
+    if (segment.points.length < 2) {
+      continue;
     }
-  });
-  context.stroke();
 
-  drawReliefLines(context, profile, width, height, band.stroke);
+    const startX = segment.startIndex * step;
+    const endX = (segment.startIndex + segment.points.length - 1) * step;
+
+    context.beginPath();
+    context.moveTo(startX, height + 8);
+    segment.points.forEach((point, offset) => {
+      context.lineTo((segment.startIndex + offset) * step, clamp(point.y, -height, height + 80));
+    });
+    context.lineTo(endX, height + 8);
+    context.closePath();
+    context.fillStyle = band.fill;
+    context.fill();
+
+    context.save();
+    context.clip();
+    context.strokeStyle = band.hatch;
+    context.lineWidth = 1;
+    const diagonalExtent = height * 0.52;
+    for (let x = startX - height; x < endX + height; x += band.hatchGap) {
+      context.beginPath();
+      context.moveTo(x, height + 4);
+      context.lineTo(x + diagonalExtent, height * 0.32);
+      context.stroke();
+    }
+    context.restore();
+
+    context.strokeStyle = band.stroke;
+    context.lineWidth = band.lineWidth;
+    context.lineJoin = "round";
+    context.lineCap = "round";
+    context.beginPath();
+    segment.points.forEach((point, offset) => {
+      const x = (segment.startIndex + offset) * step;
+      const y = clamp(point.y, -height, height + 80);
+      if (offset === 0) {
+        context.moveTo(x, y);
+      } else {
+        context.lineTo(x, y);
+      }
+    });
+    context.stroke();
+
+    drawReliefLines(context, segment, step, height, band.stroke);
+  }
   context.restore();
 }
 
 function drawReliefLines(
   context: CanvasRenderingContext2D,
-  profile: ProjectedPoint[],
-  width: number,
+  segment: ProfileSegment,
+  step: number,
   height: number,
   color: string
 ): void {
-  const step = width / Math.max(1, profile.length - 1);
   const intervals = [22, 42, 68];
 
   context.save();
@@ -366,11 +408,12 @@ function drawReliefLines(
 
   for (const interval of intervals) {
     context.beginPath();
-    profile.forEach((point, index) => {
+    segment.points.forEach((point, offset) => {
+      const index = segment.startIndex + offset;
       const x = index * step;
       const relief = interval + Math.sin(index * 0.09 + interval) * 10 + Math.cos(index * 0.035) * 8;
       const y = clamp(point.y + relief, -height, height + 80);
-      if (index === 0) {
+      if (offset === 0) {
         context.moveTo(x, y);
       } else {
         context.lineTo(x, y);
@@ -382,7 +425,7 @@ function drawReliefLines(
   context.restore();
 }
 
-function drawSkyline(context: CanvasRenderingContext2D, profile: ProjectedPoint[], width: number): void {
+function drawSkyline(context: CanvasRenderingContext2D, profile: ProfilePoint[], width: number): void {
   if (!profile.length) {
     return;
   }
@@ -393,16 +436,21 @@ function drawSkyline(context: CanvasRenderingContext2D, profile: ProjectedPoint[
   context.lineWidth = 1.7;
   context.lineJoin = "round";
   context.lineCap = "round";
-  context.beginPath();
-  profile.forEach((point, index) => {
-    const x = index * step;
-    if (index === 0) {
-      context.moveTo(x, point.y);
-    } else {
-      context.lineTo(x, point.y);
+  for (const segment of profileSegments(profile)) {
+    if (segment.points.length < 2) {
+      continue;
     }
-  });
-  context.stroke();
+    context.beginPath();
+    segment.points.forEach((point, offset) => {
+      const x = (segment.startIndex + offset) * step;
+      if (offset === 0) {
+        context.moveTo(x, point.y);
+      } else {
+        context.lineTo(x, point.y);
+      }
+    });
+    context.stroke();
+  }
   context.restore();
 }
 
