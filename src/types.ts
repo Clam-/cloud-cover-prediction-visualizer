@@ -4,7 +4,7 @@ export type CloudDataMode = "realtime" | "prediction";
 export type GeocoderSource = "openMeteo" | "nominatim" | "mapbox";
 export type MapSource = "terrainCanvas" | "osmRaster" | "mapboxRaster";
 export type CloudLayer = "low" | "mid" | "high";
-export type CloudVolumeType = "modeled" | "approximate";
+export type CloudVolumeType = "modeled" | "approximate" | "satelliteTop";
 
 export interface LocationPoint {
   lat: number;
@@ -54,6 +54,8 @@ export interface CloudSnapshot {
   high: number;
   sourceLabel: string;
   map?: CloudVolumeMap;
+  satelliteTopLabel?: string;
+  satelliteTopWarning?: string;
   warning?: string;
 }
 

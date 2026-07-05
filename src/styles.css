@@ -195,16 +195,20 @@ select:focus-visible {
 }
 
 .height-gauge {
+  --terrain-height-offset: 100%;
+  --terrain-height-shift: -100%;
   width: 100%;
   min-height: 0;
+  position: relative;
   display: grid;
-  grid-template-columns: 50px minmax(22px, 1fr);
+  grid-template-columns: 56px minmax(22px, 1fr);
   align-items: center;
   gap: 8px;
   justify-items: center;
 }
 
 .height-gauge input {
+  grid-column: 2;
   width: 100%;
   height: 100%;
   writing-mode: vertical-lr;
@@ -213,16 +217,21 @@ select:focus-visible {
 }
 
 .terrain-height-value {
-  width: 50px;
-  min-height: 32px;
+  position: absolute;
+  top: var(--terrain-height-offset);
+  left: 0;
+  width: 56px;
+  height: 32px;
   padding: 4px 5px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 6px;
   background: rgba(18, 25, 21, 0.78);
   color: #fff6d2;
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
   line-height: 1.1;
   text-align: center;
+  transform: translateY(var(--terrain-height-shift));
 }
 
 .time-control {
@@ -521,6 +530,10 @@ select:focus-visible {
 
 .cloud-volume-swatch-approximate {
   background: #ff4fb8;
+}
+
+.cloud-volume-swatch-satelliteTop {
+  background: #4de5df;
 }
 
 @media (max-width: 1120px) and (min-width: 761px) {

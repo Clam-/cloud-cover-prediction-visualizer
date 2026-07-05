@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      h5wasm:
+        specifier: ^0.10.3
+        version: 0.10.3
       suncalc:
         specifier: ^1.9.0
         version: 1.9.0
@@ -187,6 +190,9 @@ packages:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
+
+  h5wasm@0.10.3:
+    resolution: {integrity: sha512-W4Jy5ExtX/VNbyD8GdOBckDuj6AL16TemppVNxZsV3rJZEWCv2sxlCzOttZLer3zkMttbDYsWHl0qt1z3Bln+Q==}
 
   lightningcss-android-arm64@1.32.0:
     resolution: {integrity: sha512-YK7/ClTt4kAK0vo6w3X+Pnm0D2cf2vPHbhOXdoNti1Ga0al1P4TBZhwjATvjNwLEBCnKvjJc2jQgHXH0NEwlAg==}
@@ -463,6 +469,8 @@ snapshots:
 
   fsevents@2.3.3:
     optional: true
+
+  h5wasm@0.10.3: {}
 
   lightningcss-android-arm64@1.32.0:
     optional: true

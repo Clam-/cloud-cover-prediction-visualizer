@@ -1,6 +1,7 @@
 import { clamp, hashNumber, offsetLocation, seededRandom } from "../geo";
 import { readPersistentCache, writePersistentCache } from "./cache";
 import { hrrrZarrCoversLocation, loadHrrrZarrClouds } from "./hrrr";
+import { withRealtimeSatelliteCloudTops } from "./satelliteCloudTops";
 import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudSource, CloudVolume, LocationPoint, Settings } from "../types";
 
 interface OpenMeteoGridPointBody {
@@ -112,11 +113,11 @@ export async function loadCloudSnapshot(
   }
 
   try {
+    let snapshot: CloudSnapshot;
     if (settings.cloudSource === "hrrrZarr") {
-      return await loadHrrrZarrCloudsWithGlobalFallback(location, time, signal, mode, settings);
-    }
-    if (settings.cloudSource === "openMeteoBom") {
-      return await loadOpenMeteoCloudsWithGlobalFallback(
+      snapshot = await loadHrrrZarrCloudsWithGlobalFallback(location, time, signal, mode, settings);
+    } else if (settings.cloudSource === "openMeteoBom") {
+      snapshot = await loadOpenMeteoCloudsWithGlobalFallback(
         location,
         time,
         settings,
@@ -124,15 +125,17 @@ export async function loadCloudSnapshot(
         mode,
         OPEN_METEO_CLOUD_SOURCE_CONFIGS.openMeteoBom
       );
+    } else {
+      snapshot = await loadOpenMeteoGridClouds(
+        location,
+        time,
+        settings,
+        signal,
+        mode,
+        OPEN_METEO_CLOUD_SOURCE_CONFIGS[settings.cloudSource]
+      );
     }
-    return await loadOpenMeteoGridClouds(
-      location,
-      time,
-      settings,
-      signal,
-      mode,
-      OPEN_METEO_CLOUD_SOURCE_CONFIGS[settings.cloudSource]
-    );
+    return await withRealtimeSatelliteCloudTops(snapshot, location, time, signal);
   } catch (error) {
     if (isAbortError(error, signal)) {
       throw error;

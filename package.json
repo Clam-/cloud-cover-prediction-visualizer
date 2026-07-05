@@ -9,6 +9,7 @@
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
+    "h5wasm": "^0.10.3",
     "suncalc": "^1.9.0",
     "three": "^0.185.1"
   },

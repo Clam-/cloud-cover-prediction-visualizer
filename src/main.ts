@@ -106,13 +106,15 @@ const mapboxToken = element<HTMLInputElement>("mapboxToken");
 const openMeteoKey = element<HTMLInputElement>("openMeteoKey");
 const terrainScale = element<HTMLInputElement>("terrainScale");
 const MIN_EYE_ELEVATION_METERS = 0;
-const MAX_EYE_ELEVATION_METERS = 1000;
+const MAX_EYE_ELEVATION_METERS = 10000;
+const EYE_ELEVATION_SLIDER_STEPS = 1000;
+const EYE_ELEVATION_SLIDER_EXPONENT = 2.4;
 const HEIGHT_TERRAIN_SNAP_METERS = 5;
 const TERRAIN_REUSE_RADIUS_FRACTION = 0.55;
 const CLOUD_RELOAD_DEBOUNCE_MS = 500;
 const REALTIME_CLOUD_REFRESH_MS = 5 * 60 * 1000;
 const CLOUD_REUSE_DISTANCE_METERS = 30000;
-const CLOUD_VOLUME_TYPES: CloudVolumeType[] = ["modeled", "approximate"];
+const CLOUD_VOLUME_TYPES: CloudVolumeType[] = ["modeled", "approximate", "satelliteTop"];
 const CLOUD_VOLUME_STYLES = {
   modeled: {
     low: {
@@ -158,6 +160,29 @@ const CLOUD_VOLUME_STYLES = {
       renderOrder: 4,
       horizontalScale: 1.32,
       verticalScale: 0.62
+    }
+  },
+  satelliteTop: {
+    low: {
+      color: "#e58f4d",
+      opacity: 0.32,
+      renderOrder: 9,
+      horizontalScale: 0.82,
+      verticalScale: 0.24
+    },
+    mid: {
+      color: "#e58f4d",
+      opacity: 0.27,
+      renderOrder: 8,
+      horizontalScale: 0.94,
+      verticalScale: 0.2
+    },
+    high: {
+      color: "#e58f4d",
+      opacity: 0.22,
+      renderOrder: 7,
+      horizontalScale: 1.12,
+      verticalScale: 0.16
     }
   }
 } as const satisfies Record<CloudVolumeType, Record<CloudLayer, CloudVolumeStyle>>;
@@ -309,15 +334,16 @@ class HorizonApp {
       void this.performSearch();
     });
 
-    heightSlider.min = String(MIN_EYE_ELEVATION_METERS);
-    heightSlider.max = String(MAX_EYE_ELEVATION_METERS);
+    heightSlider.min = "0";
+    heightSlider.max = String(EYE_ELEVATION_SLIDER_STEPS);
+    heightSlider.step = "1";
     heightSlider.addEventListener("input", () => {
-      this.setEyeElevation(Number(heightSlider.value));
+      this.setEyeElevation(eyeElevationFromSliderValue(Number(heightSlider.value)));
       this.updateHud();
       this.updateCamera();
     });
     heightSlider.addEventListener("change", () => {
-      this.setEyeElevation(Number(heightSlider.value), true);
+      this.setEyeElevation(eyeElevationFromSliderValue(Number(heightSlider.value)), true);
       this.updateHud();
       this.updateCamera();
     });
@@ -791,6 +817,11 @@ class HorizonApp {
         low: [],
         mid: [],
         high: []
+      },
+      satelliteTop: {
+        low: [],
+        mid: [],
+        high: []
       }
     };
 
@@ -817,7 +848,7 @@ class HorizonApp {
           vertexColors: true
         });
         const mesh = new THREE.InstancedMesh(geometry, material, specs.length);
-        mesh.name = `${volumeType}-${layer}-forecast-cloud-volumes`;
+        mesh.name = `${volumeType}-${layer}-cloud-volumes`;
         mesh.frustumCulled = false;
         mesh.renderOrder = style.renderOrder;
         mesh.userData.drift = false;
@@ -1108,9 +1139,11 @@ class HorizonApp {
     const relativeHeight = eyeElevation - terrainHeight;
     heightValue.textContent = `${eyeElevation} m\n(${formatSignedMeters(relativeHeight)})`;
     terrainHeightValue.textContent = `${terrainHeight} m`;
+    updateTerrainHeightMarker(terrainHeight);
     fovValue.textContent = `${Math.round(this.fov)} deg`;
     timeValue.textContent = this.cloudMode === "realtime" ? `Now · ${formatTime(this.time)}` : formatTime(this.time);
-    heightSlider.value = String(clamp(eyeElevation, MIN_EYE_ELEVATION_METERS, MAX_EYE_ELEVATION_METERS));
+    heightSlider.value = String(sliderValueFromEyeElevation(eyeElevation));
+    heightSlider.setAttribute("aria-valuetext", `${eyeElevation} m`);
     fovSlider.value = String(this.fov);
     this.updateCloudReadout();
   }
@@ -1235,7 +1268,8 @@ class HorizonApp {
   }
 
   private appendCloudVolumeKey(): void {
-    if (!hasApproximateCloudVolumes(this.clouds)) {
+    const types = visibleCloudVolumeTypes(this.clouds);
+    if (types.length <= 1) {
       return;
     }
     const key = document.createElement("div");
@@ -1243,7 +1277,7 @@ class HorizonApp {
     const label = document.createElement("span");
     label.className = "cloud-volume-key-label";
     label.textContent = "Volume hue";
-    key.append(label, cloudVolumeKeyItem("modeled", "pale modeled"), cloudVolumeKeyItem("approximate", "magenta approximate"));
+    key.append(label, ...types.map((type) => cloudVolumeKeyItem(type, cloudVolumeKeyLabel(type))));
     statusPill.append(key);
   }
 
@@ -1300,6 +1334,15 @@ class HorizonApp {
       clouds.warning
         ? {
             message: `Cloud service issue: ${clouds.warning}; using ${cloudFallbackLabel(clouds)}.`,
+            severity: "warning"
+          }
+        : undefined
+    );
+    this.updateDiagnostic(
+      "satellite-cloud-top",
+      clouds.satelliteTopWarning
+        ? {
+            message: clouds.satelliteTopWarning,
             severity: "warning"
           }
         : undefined
@@ -1386,6 +1429,28 @@ function setMeter(element: HTMLElement, value: number, hasData: boolean): void {
   element.setAttribute("aria-valuenow", String(cover));
 }
 
+function eyeElevationFromSliderValue(value: number): number {
+  const position = clamp(value / EYE_ELEVATION_SLIDER_STEPS, 0, 1);
+  const scaled = Math.pow(position, EYE_ELEVATION_SLIDER_EXPONENT);
+  return MIN_EYE_ELEVATION_METERS + scaled * (MAX_EYE_ELEVATION_METERS - MIN_EYE_ELEVATION_METERS);
+}
+
+function sliderPositionFromEyeElevation(value: number): number {
+  const range = MAX_EYE_ELEVATION_METERS - MIN_EYE_ELEVATION_METERS;
+  const normalized = clamp((value - MIN_EYE_ELEVATION_METERS) / range, 0, 1);
+  return Math.pow(normalized, 1 / EYE_ELEVATION_SLIDER_EXPONENT);
+}
+
+function sliderValueFromEyeElevation(value: number): number {
+  return Math.round(sliderPositionFromEyeElevation(value) * EYE_ELEVATION_SLIDER_STEPS);
+}
+
+function updateTerrainHeightMarker(terrainHeight: number): void {
+  const offset = 1 - sliderPositionFromEyeElevation(terrainHeight);
+  terrainHeightValue.style.setProperty("--terrain-height-offset", `${offset * 100}%`);
+  terrainHeightValue.style.setProperty("--terrain-height-shift", `${offset * -100}%`);
+}
+
 function formatSignedMeters(value: number): string {
   return `${value >= 0 ? "+" : ""}${value} m`;
 }
@@ -1398,8 +1463,22 @@ function cloudVolumeType(volume: CloudVolume): CloudVolumeType {
   return volume.volumeType ?? "modeled";
 }
 
-function hasApproximateCloudVolumes(clouds: CloudSnapshot | undefined): boolean {
-  return clouds?.map?.volumes.some((volume) => cloudVolumeType(volume) === "approximate") === true;
+function visibleCloudVolumeTypes(clouds: CloudSnapshot | undefined): CloudVolumeType[] {
+  const types = new Set<CloudVolumeType>();
+  clouds?.map?.volumes.forEach((volume) => {
+    types.add(cloudVolumeType(volume));
+  });
+  return CLOUD_VOLUME_TYPES.filter((type) => types.has(type));
+}
+
+function cloudVolumeKeyLabel(type: CloudVolumeType): string {
+  if (type === "approximate") {
+    return "magenta approximate";
+  }
+  if (type === "satelliteTop") {
+    return "teal satellite top";
+  }
+  return "pale modeled";
 }
 
 function cloudVolumeKeyItem(type: CloudVolumeType, label: string): HTMLElement {

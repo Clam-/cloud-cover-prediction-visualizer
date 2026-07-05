@@ -7,8 +7,7 @@ export interface TerrainSurfacePoint {
   north: number;
 }
 
-const EARTH_RADIUS_METERS = 6371008.8;
-const REFRACTION_COEFFICIENT = 0.13;
+const PEAKFINDER_CURVATURE_DROP_COEFFICIENT = 6.54443e-8;
 const NEAR_VIEWPOINT_DROP_METERS = 20;
 const NEAR_VIEWPOINT_DROP_RANGE_METERS = 1000;
 
@@ -18,7 +17,7 @@ export function smoothstep(value: number): number {
 }
 
 export function terrainCurvatureDrop(distanceMeters: number): number {
-  return ((distanceMeters * distanceMeters) / (2 * EARTH_RADIUS_METERS)) * (1 - REFRACTION_COEFFICIENT);
+  return distanceMeters * distanceMeters * PEAKFINDER_CURVATURE_DROP_COEFFICIENT;
 }
 
 export function nearViewpointTerrainDrop(distanceMeters: number): number {
