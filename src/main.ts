@@ -161,6 +161,10 @@ const CLOUD_VOLUME_STYLES = {
   }
 } as const satisfies Record<CloudVolumeType, Record<CloudLayer, CloudVolumeStyle>>;
 
+function worldZFromNorth(north: number): number {
+  return -north;
+}
+
 class HorizonApp {
   private readonly renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
   private readonly scene = new THREE.Scene();
@@ -665,7 +669,7 @@ class HorizonApp {
         const y = (sample.elevation - grid.groundElevation) * this.settings.terrainVerticalScale;
         positions[index * 3] = sample.east;
         positions[index * 3 + 1] = y;
-        positions[index * 3 + 2] = sample.north;
+        positions[index * 3 + 2] = worldZFromNorth(sample.north);
 
         const t = clamp((sample.elevation - min) / (max - min), 0, 1);
         if (sample.elevation <= 0) {
@@ -756,7 +760,7 @@ class HorizonApp {
             depthWrite: false
           })
         );
-        sprite.position.set(Math.sin(angle) * radius, layer.altitude + random() * 800, Math.cos(angle) * radius);
+        sprite.position.set(Math.sin(angle) * radius, layer.altitude + random() * 800, worldZFromNorth(Math.cos(angle) * radius));
         sprite.scale.set(layer.scale[0] * (0.65 + random() * 0.9), layer.scale[1] * (0.7 + random() * 0.8), 1);
         sprite.userData.drift = true;
         this.cloudGroup.add(sprite);
@@ -842,7 +846,7 @@ class HorizonApp {
       const position = new THREE.Vector3(
         volume.east + Math.cos(angle) * spread,
         altitude + (random() - 0.5) * volume.thicknessMeters * 0.45,
-        volume.north + Math.sin(angle) * spread
+        worldZFromNorth(volume.north + Math.sin(angle) * spread)
       );
       const horizontalDensity = 0.74 + volume.cover / 180;
       const scale = new THREE.Vector3(
@@ -952,7 +956,7 @@ class HorizonApp {
 
   private celestialToWorld(azimuth: number, altitude: number, radius: number): THREE.Vector3 {
     const horizontal = Math.cos(altitude) * radius;
-    return new THREE.Vector3(-Math.sin(azimuth) * horizontal, Math.sin(altitude) * radius, -Math.cos(azimuth) * horizontal);
+    return new THREE.Vector3(-Math.sin(azimuth) * horizontal, Math.sin(altitude) * radius, Math.cos(azimuth) * horizontal);
   }
 
   private onPointerDown(event: PointerEvent): void {
@@ -1015,7 +1019,7 @@ class HorizonApp {
     if (!hit) {
       return;
     }
-    const next = offsetLocation(this.location, hit.point.x, hit.point.z);
+    const next = offsetLocation(this.location, hit.point.x, -hit.point.z);
     next.label = `Terrain ${next.label}`;
     void this.warpTo(next, false);
   }
@@ -1023,7 +1027,11 @@ class HorizonApp {
   private updateCamera(): void {
     this.camera.fov = this.fov;
     this.camera.position.set(0, this.heightOffset, 0);
-    const direction = new THREE.Vector3(Math.sin(this.yaw) * Math.cos(this.pitch), Math.sin(this.pitch), Math.cos(this.yaw) * Math.cos(this.pitch));
+    const direction = new THREE.Vector3(
+      Math.sin(this.yaw) * Math.cos(this.pitch),
+      Math.sin(this.pitch),
+      worldZFromNorth(Math.cos(this.yaw) * Math.cos(this.pitch))
+    );
     this.camera.lookAt(this.camera.position.clone().add(direction));
     this.camera.updateProjectionMatrix();
     this.renderPanorama();
