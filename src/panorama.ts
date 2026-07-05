@@ -14,9 +14,7 @@ interface TerrainBand {
   maxDistance: number;
   fill: string;
   stroke: string;
-  hatch: string;
   lineWidth: number;
-  hatchGap: number;
 }
 
 interface ProjectedPoint {
@@ -35,54 +33,66 @@ interface ProfileSegment {
   points: ProjectedPoint[];
 }
 
+interface RasterVertex {
+  depth: number;
+  x: number;
+  y: number;
+}
+
+interface DepthRaster {
+  cellHeight: number;
+  cellWidth: number;
+  depths: Float32Array;
+  height: number;
+  width: number;
+}
+
 const EARTH_RADIUS_METERS = 6371008.8;
 const REFRACTION_COEFFICIENT = 0.13;
 const MIN_SAMPLE_DISTANCE_METERS = 220;
+const DEPTH_RASTER_SCALE = 2.8;
+const DEPTH_RASTER_MIN_WIDTH = 260;
+const DEPTH_RASTER_MAX_WIDTH = 720;
+const DEPTH_RASTER_MIN_HEIGHT = 140;
+const DEPTH_RASTER_MAX_HEIGHT = 420;
+const DEPTH_EDGE_BUCKETS = 5;
+const DEPTH_EDGE_LOG_THRESHOLD = 0.1;
+const RASTER_FOV_MARGIN_RADIANS = 0.24;
 const TERRAIN_BANDS: TerrainBand[] = [
   {
     minDistance: 42000,
     maxDistance: 98000,
     fill: "rgba(208, 211, 204, 0.68)",
     stroke: "rgba(28, 32, 31, 0.55)",
-    hatch: "rgba(24, 28, 27, 0.055)",
-    lineWidth: 0.9,
-    hatchGap: 22
+    lineWidth: 0.9
   },
   {
     minDistance: 28000,
     maxDistance: 52000,
     fill: "rgba(222, 223, 215, 0.78)",
     stroke: "rgba(24, 28, 27, 0.68)",
-    hatch: "rgba(24, 28, 27, 0.07)",
-    lineWidth: 1,
-    hatchGap: 20
+    lineWidth: 1
   },
   {
     minDistance: 15500,
     maxDistance: 33000,
     fill: "rgba(235, 234, 225, 0.86)",
     stroke: "rgba(20, 24, 23, 0.76)",
-    hatch: "rgba(24, 28, 27, 0.085)",
-    lineWidth: 1.15,
-    hatchGap: 18
+    lineWidth: 1.15
   },
   {
     minDistance: 6500,
     maxDistance: 18500,
     fill: "rgba(245, 242, 232, 0.92)",
     stroke: "rgba(18, 22, 21, 0.84)",
-    hatch: "rgba(24, 28, 27, 0.1)",
-    lineWidth: 1.25,
-    hatchGap: 16
+    lineWidth: 1.25
   },
   {
     minDistance: MIN_SAMPLE_DISTANCE_METERS,
     maxDistance: 7600,
     fill: "rgba(250, 247, 237, 0.96)",
     stroke: "rgba(12, 16, 15, 0.9)",
-    hatch: "rgba(24, 28, 27, 0.115)",
-    lineWidth: 1.35,
-    hatchGap: 15
+    lineWidth: 1.35
   }
 ];
 
@@ -115,6 +125,7 @@ export class PanoramaRenderer {
 
     const projection = createProjection(width, height, options);
     const columnCount = Math.round(clamp(width / 2.25, 320, 760));
+    const depthRaster = createDepthRaster(grid, options, projection, width, height);
     const profiles = TERRAIN_BANDS.map(() => new Array<ProfilePoint>(columnCount));
     const skyline = new Array<ProfilePoint>(columnCount);
 
@@ -167,6 +178,7 @@ export class PanoramaRenderer {
       drawTerrainBand(context, profile, TERRAIN_BANDS[index], width, height);
     });
 
+    drawDepthDiscontinuities(context, depthRaster);
     drawSkyline(context, interpolateProfile(skyline), width);
   }
 
@@ -216,6 +228,129 @@ function altitudeToY(
   projection: Pick<ReturnType<typeof createProjection>, "focalY" | "height" | "pitch">
 ): number {
   return projection.height / 2 - Math.tan(altitude - projection.pitch) * projection.focalY;
+}
+
+function createDepthRaster(
+  grid: TerrainGrid,
+  options: PanoramaOptions,
+  projection: ReturnType<typeof createProjection>,
+  width: number,
+  height: number
+): DepthRaster {
+  const rasterWidth = Math.round(clamp(width / DEPTH_RASTER_SCALE, DEPTH_RASTER_MIN_WIDTH, DEPTH_RASTER_MAX_WIDTH));
+  const rasterHeight = Math.round(clamp(height / DEPTH_RASTER_SCALE, DEPTH_RASTER_MIN_HEIGHT, DEPTH_RASTER_MAX_HEIGHT));
+  const raster: DepthRaster = {
+    cellHeight: height / rasterHeight,
+    cellWidth: width / rasterWidth,
+    depths: new Float32Array(rasterWidth * rasterHeight),
+    height: rasterHeight,
+    width: rasterWidth
+  };
+  raster.depths.fill(Number.POSITIVE_INFINITY);
+
+  const vertices = grid.samples.map((row) =>
+    row.map((sample) => projectRasterVertex(sample, grid, options, projection, width, height, rasterWidth, rasterHeight))
+  );
+
+  for (let z = 0; z < grid.resolution - 1; z += 1) {
+    for (let x = 0; x < grid.resolution - 1; x += 1) {
+      const a = vertices[z][x];
+      const b = vertices[z][x + 1];
+      const c = vertices[z + 1][x];
+      const d = vertices[z + 1][x + 1];
+      rasterizeTriangle(raster, a, c, b);
+      rasterizeTriangle(raster, b, c, d);
+    }
+  }
+
+  return raster;
+}
+
+function projectRasterVertex(
+  sample: TerrainSample,
+  grid: TerrainGrid,
+  options: PanoramaOptions,
+  projection: ReturnType<typeof createProjection>,
+  width: number,
+  height: number,
+  rasterWidth: number,
+  rasterHeight: number
+): RasterVertex | undefined {
+  const distance = Math.hypot(sample.east, sample.north);
+  if (distance < MIN_SAMPLE_DISTANCE_METERS) {
+    return undefined;
+  }
+
+  const bearing = Math.atan2(sample.east, sample.north);
+  const angleOffset = wrapRadians(bearing - options.yaw);
+  if (Math.abs(angleOffset) > projection.halfHorizontalFov + RASTER_FOV_MARGIN_RADIANS) {
+    return undefined;
+  }
+
+  const curvatureDrop = ((distance * distance) / (2 * EARTH_RADIUS_METERS)) * (1 - REFRACTION_COEFFICIENT);
+  const apparentHeight = (sample.elevation - grid.groundElevation) * options.verticalScale - curvatureDrop - options.heightOffset;
+  const altitude = Math.atan2(apparentHeight, distance);
+  const screenX = ((angleOffset + projection.halfHorizontalFov) / projection.horizontalFov) * (width - 1);
+  const screenY = altitudeToY(altitude, projection);
+  const viewDepth = Math.max(1, distance * Math.cos(angleOffset));
+
+  return {
+    depth: viewDepth,
+    x: (screenX / Math.max(1, width - 1)) * (rasterWidth - 1),
+    y: (screenY / Math.max(1, height - 1)) * (rasterHeight - 1)
+  };
+}
+
+function rasterizeTriangle(
+  raster: DepthRaster,
+  a: RasterVertex | undefined,
+  b: RasterVertex | undefined,
+  c: RasterVertex | undefined
+): void {
+  if (!a || !b || !c) {
+    return;
+  }
+
+  const minX = Math.max(0, Math.floor(Math.min(a.x, b.x, c.x)));
+  const maxX = Math.min(raster.width - 1, Math.ceil(Math.max(a.x, b.x, c.x)));
+  const minY = Math.max(0, Math.floor(Math.min(a.y, b.y, c.y)));
+  const maxY = Math.min(raster.height - 1, Math.ceil(Math.max(a.y, b.y, c.y)));
+  if (minX > maxX || minY > maxY) {
+    return;
+  }
+
+  const area = edgeFunction(a, b, c.x, c.y);
+  if (Math.abs(area) < 0.0001) {
+    return;
+  }
+
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      const pointX = x + 0.5;
+      const pointY = y + 0.5;
+      const w0 = edgeFunction(b, c, pointX, pointY) / area;
+      const w1 = edgeFunction(c, a, pointX, pointY) / area;
+      const w2 = edgeFunction(a, b, pointX, pointY) / area;
+      if (w0 < -0.0001 || w1 < -0.0001 || w2 < -0.0001) {
+        continue;
+      }
+
+      const reciprocalDepth = w0 / a.depth + w1 / b.depth + w2 / c.depth;
+      if (reciprocalDepth <= 0) {
+        continue;
+      }
+
+      const depth = 1 / reciprocalDepth;
+      const index = y * raster.width + x;
+      if (depth < raster.depths[index]) {
+        raster.depths[index] = depth;
+      }
+    }
+  }
+}
+
+function edgeFunction(a: Pick<RasterVertex, "x" | "y">, b: Pick<RasterVertex, "x" | "y">, x: number, y: number): number {
+  return (x - a.x) * (b.y - a.y) - (y - a.y) * (b.x - a.x);
 }
 
 function interpolateProfile(profile: ProfilePoint[]): ProfilePoint[] {
@@ -359,19 +494,6 @@ function drawTerrainBand(
     context.fillStyle = band.fill;
     context.fill();
 
-    context.save();
-    context.clip();
-    context.strokeStyle = band.hatch;
-    context.lineWidth = 1;
-    const diagonalExtent = height * 0.52;
-    for (let x = startX - height; x < endX + height; x += band.hatchGap) {
-      context.beginPath();
-      context.moveTo(x, height + 4);
-      context.lineTo(x + diagonalExtent, height * 0.32);
-      context.stroke();
-    }
-    context.restore();
-
     context.strokeStyle = band.stroke;
     context.lineWidth = band.lineWidth;
     context.lineJoin = "round";
@@ -387,42 +509,106 @@ function drawTerrainBand(
       }
     });
     context.stroke();
-
-    drawReliefLines(context, segment, step, height, band.stroke);
   }
   context.restore();
 }
 
-function drawReliefLines(
-  context: CanvasRenderingContext2D,
-  segment: ProfileSegment,
-  step: number,
-  height: number,
-  color: string
-): void {
-  const intervals = [22, 42, 68];
+function drawDepthDiscontinuities(context: CanvasRenderingContext2D, raster: DepthRaster): void {
+  const paths = Array.from({ length: DEPTH_EDGE_BUCKETS }, () => new Path2D());
+  const counts = new Array<number>(DEPTH_EDGE_BUCKETS).fill(0);
 
-  context.save();
-  context.strokeStyle = color.replace(/[\d.]+\)$/u, "0.22)");
-  context.lineWidth = 0.75;
+  for (let y = 0; y < raster.height; y += 1) {
+    for (let x = 0; x < raster.width; x += 1) {
+      const index = y * raster.width + x;
+      const depth = raster.depths[index];
 
-  for (const interval of intervals) {
-    context.beginPath();
-    segment.points.forEach((point, offset) => {
-      const index = segment.startIndex + offset;
-      const x = index * step;
-      const relief = interval + Math.sin(index * 0.09 + interval) * 10 + Math.cos(index * 0.035) * 8;
-      const y = clamp(point.y + relief, -height, height + 80);
-      if (offset === 0) {
-        context.moveTo(x, y);
-      } else {
-        context.lineTo(x, y);
+      if (x < raster.width - 1) {
+        addDepthEdge(
+          paths,
+          counts,
+          depth,
+          raster.depths[index + 1],
+          (x + 1) * raster.cellWidth,
+          y * raster.cellHeight,
+          (x + 1) * raster.cellWidth,
+          (y + 1) * raster.cellHeight
+        );
       }
-    });
-    context.stroke();
+
+      if (y < raster.height - 1) {
+        addDepthEdge(
+          paths,
+          counts,
+          depth,
+          raster.depths[index + raster.width],
+          x * raster.cellWidth,
+          (y + 1) * raster.cellHeight,
+          (x + 1) * raster.cellWidth,
+          (y + 1) * raster.cellHeight
+        );
+      }
+    }
   }
 
+  context.save();
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  for (let bucket = 0; bucket < paths.length; bucket += 1) {
+    if (!counts[bucket]) {
+      continue;
+    }
+    const strength = (bucket + 0.5) / DEPTH_EDGE_BUCKETS;
+    context.strokeStyle = `rgba(3, 5, 5, ${0.22 + strength * 0.5})`;
+    context.lineWidth = 0.45 + strength * 2.35;
+    context.stroke(paths[bucket]);
+  }
   context.restore();
+}
+
+function addDepthEdge(
+  paths: Path2D[],
+  counts: number[],
+  a: number,
+  b: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number
+): void {
+  const strength = depthEdgeStrength(a, b);
+  if (strength <= 0) {
+    return;
+  }
+
+  const bucket = Math.min(DEPTH_EDGE_BUCKETS - 1, Math.floor(strength * DEPTH_EDGE_BUCKETS));
+  paths[bucket].moveTo(x1, y1);
+  paths[bucket].lineTo(x2, y2);
+  counts[bucket] += 1;
+}
+
+function depthEdgeStrength(a: number, b: number): number {
+  const aFinite = Number.isFinite(a);
+  const bFinite = Number.isFinite(b);
+  if (!aFinite && !bFinite) {
+    return 0;
+  }
+
+  if (!aFinite || !bFinite) {
+    const finiteDepth = aFinite ? a : b;
+    const nearWeight = 1 - clamp(finiteDepth / 70000, 0, 1);
+    return clamp(0.36 + nearWeight * 0.42, 0, 0.86);
+  }
+
+  const near = Math.min(a, b);
+  const far = Math.max(a, b);
+  const logJump = Math.log(far / Math.max(1, near));
+  if (logJump < DEPTH_EDGE_LOG_THRESHOLD) {
+    return 0;
+  }
+
+  const absoluteJump = far - near;
+  const nearWeight = 1 - clamp(near / 65000, 0, 1);
+  return clamp((logJump - DEPTH_EDGE_LOG_THRESHOLD) / 1.15 + nearWeight * 0.14 + clamp(absoluteJump / 42000, 0, 0.22), 0, 1);
 }
 
 function drawSkyline(context: CanvasRenderingContext2D, profile: ProfilePoint[], width: number): void {
