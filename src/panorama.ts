@@ -1,5 +1,6 @@
 import { clamp } from "./geo";
-import type { TerrainGrid, TerrainSample } from "./types";
+import { projectedTerrainHeight, smoothstep, terrainSurfacePointAt, terrainSurfaceResolution, type TerrainSurfacePoint } from "./terrainSurface";
+import type { TerrainGrid } from "./types";
 
 interface PanoramaOptions {
   fov: number;
@@ -22,7 +23,6 @@ interface ProjectedPoint {
   bearing: number;
   distance: number;
   elevation: number;
-  sample: TerrainSample;
   y: number;
 }
 
@@ -47,8 +47,6 @@ interface DepthRaster {
   width: number;
 }
 
-const EARTH_RADIUS_METERS = 6371008.8;
-const REFRACTION_COEFFICIENT = 0.13;
 const MIN_SAMPLE_DISTANCE_METERS = 220;
 const DEPTH_RASTER_SCALE = 2.8;
 const DEPTH_RASTER_MIN_WIDTH = 260;
@@ -128,44 +126,32 @@ export class PanoramaRenderer {
     const depthRaster = createDepthRaster(grid, options, projection, width, height);
     const profiles = TERRAIN_BANDS.map(() => new Array<ProfilePoint>(columnCount));
     const skyline = new Array<ProfilePoint>(columnCount);
+    const surfaceResolution = terrainSurfaceResolution(grid);
 
-    for (const row of grid.samples) {
-      for (const sample of row) {
-        const distance = Math.hypot(sample.east, sample.north);
-        if (distance < MIN_SAMPLE_DISTANCE_METERS) {
+    for (let z = 0; z < surfaceResolution; z += 1) {
+      for (let x = 0; x < surfaceResolution; x += 1) {
+        const point = terrainSurfacePointAt(grid, x, z, surfaceResolution);
+        if (!point) {
+          continue;
+        }
+        const projected = projectTerrainPoint(point, grid, options, projection);
+        if (!projected) {
           continue;
         }
 
-        const bearing = Math.atan2(sample.east, sample.north);
-        const angleOffset = wrapRadians(bearing - options.yaw);
-        if (Math.abs(angleOffset) > projection.halfHorizontalFov) {
-          continue;
-        }
-
+        const angleOffset = wrapRadians(projected.bearing - options.yaw);
         const column = Math.round(((angleOffset + projection.halfHorizontalFov) / projection.horizontalFov) * (columnCount - 1));
         if (column < 0 || column >= columnCount) {
           continue;
         }
 
-        const curvatureDrop = ((distance * distance) / (2 * EARTH_RADIUS_METERS)) * (1 - REFRACTION_COEFFICIENT);
-        const apparentHeight = (sample.elevation - grid.groundElevation) * options.verticalScale - curvatureDrop - options.heightOffset;
-        const altitude = Math.atan2(apparentHeight, distance);
-        const point: ProjectedPoint = {
-          altitude,
-          bearing,
-          distance,
-          elevation: sample.elevation,
-          sample,
-          y: altitudeToY(altitude, projection)
-        };
-
-        if (!skyline[column] || altitude > skyline[column]!.altitude) {
-          skyline[column] = point;
+        if (!skyline[column] || projected.altitude > skyline[column]!.altitude) {
+          skyline[column] = projected;
         }
 
-        const bandIndex = TERRAIN_BANDS.findIndex((band) => distance >= band.minDistance && distance < band.maxDistance);
-        if (bandIndex >= 0 && (!profiles[bandIndex][column] || altitude > profiles[bandIndex][column]!.altitude)) {
-          profiles[bandIndex][column] = point;
+        const bandIndex = TERRAIN_BANDS.findIndex((band) => projected.distance >= band.minDistance && projected.distance < band.maxDistance);
+        if (bandIndex >= 0 && (!profiles[bandIndex][column] || projected.altitude > profiles[bandIndex][column]!.altitude)) {
+          profiles[bandIndex][column] = projected;
         }
       }
     }
@@ -248,12 +234,16 @@ function createDepthRaster(
   };
   raster.depths.fill(Number.POSITIVE_INFINITY);
 
-  const vertices = grid.samples.map((row) =>
-    row.map((sample) => projectRasterVertex(sample, grid, options, projection, width, height, rasterWidth, rasterHeight))
+  const surfaceResolution = terrainSurfaceResolution(grid, 121);
+  const vertices = Array.from({ length: surfaceResolution }, (_, z) =>
+    Array.from({ length: surfaceResolution }, (_, x) => {
+      const point = terrainSurfacePointAt(grid, x, z, surfaceResolution);
+      return point ? projectRasterVertex(point, grid, options, projection, width, height, rasterWidth, rasterHeight) : undefined;
+    })
   );
 
-  for (let z = 0; z < grid.resolution - 1; z += 1) {
-    for (let x = 0; x < grid.resolution - 1; x += 1) {
+  for (let z = 0; z < surfaceResolution - 1; z += 1) {
+    for (let x = 0; x < surfaceResolution - 1; x += 1) {
       const a = vertices[z][x];
       const b = vertices[z][x + 1];
       const c = vertices[z + 1][x];
@@ -267,7 +257,7 @@ function createDepthRaster(
 }
 
 function projectRasterVertex(
-  sample: TerrainSample,
+  point: TerrainSurfacePoint,
   grid: TerrainGrid,
   options: PanoramaOptions,
   projection: ReturnType<typeof createProjection>,
@@ -276,28 +266,49 @@ function projectRasterVertex(
   rasterWidth: number,
   rasterHeight: number
 ): RasterVertex | undefined {
-  const distance = Math.hypot(sample.east, sample.north);
-  if (distance < MIN_SAMPLE_DISTANCE_METERS) {
+  const projected = projectTerrainPoint(point, grid, options, projection);
+  if (!projected) {
     return undefined;
   }
 
-  const bearing = Math.atan2(sample.east, sample.north);
-  const angleOffset = wrapRadians(bearing - options.yaw);
-  if (Math.abs(angleOffset) > projection.halfHorizontalFov + RASTER_FOV_MARGIN_RADIANS) {
-    return undefined;
-  }
-
-  const curvatureDrop = ((distance * distance) / (2 * EARTH_RADIUS_METERS)) * (1 - REFRACTION_COEFFICIENT);
-  const apparentHeight = (sample.elevation - grid.groundElevation) * options.verticalScale - curvatureDrop - options.heightOffset;
-  const altitude = Math.atan2(apparentHeight, distance);
+  const distance = projected.distance;
+  const angleOffset = wrapRadians(projected.bearing - options.yaw);
   const screenX = ((angleOffset + projection.halfHorizontalFov) / projection.horizontalFov) * (width - 1);
-  const screenY = altitudeToY(altitude, projection);
   const viewDepth = Math.max(1, distance * Math.cos(angleOffset));
 
   return {
     depth: viewDepth,
     x: (screenX / Math.max(1, width - 1)) * (rasterWidth - 1),
-    y: (screenY / Math.max(1, height - 1)) * (rasterHeight - 1)
+    y: (projected.y / Math.max(1, height - 1)) * (rasterHeight - 1)
+  };
+}
+
+function projectTerrainPoint(
+  point: TerrainSurfacePoint,
+  grid: TerrainGrid,
+  options: PanoramaOptions,
+  projection: ReturnType<typeof createProjection>
+): ProjectedPoint | undefined {
+  const distance = Math.hypot(point.east, point.north);
+  if (distance < MIN_SAMPLE_DISTANCE_METERS) {
+    return undefined;
+  }
+
+  const bearing = Math.atan2(point.east, point.north);
+  const angleOffset = wrapRadians(bearing - options.yaw);
+  if (Math.abs(angleOffset) > projection.halfHorizontalFov + RASTER_FOV_MARGIN_RADIANS) {
+    return undefined;
+  }
+
+  const apparentHeight = projectedTerrainHeight(point.elevation, grid.groundElevation, distance, options.verticalScale) - options.heightOffset;
+  const altitude = Math.atan2(apparentHeight, distance);
+
+  return {
+    altitude,
+    bearing,
+    distance,
+    elevation: point.elevation,
+    y: altitudeToY(altitude, projection)
   };
 }
 
@@ -399,7 +410,6 @@ function mixProjectedPoint(a: ProjectedPoint, b: ProjectedPoint, t: number): Pro
     bearing: lerpAngle(a.bearing, b.bearing, t),
     distance: lerp(a.distance, b.distance, t),
     elevation: lerp(a.elevation, b.elevation, t),
-    sample: t < 0.5 ? a.sample : b.sample,
     y: lerp(a.y, b.y, t)
   };
 }
@@ -608,7 +618,8 @@ function depthEdgeStrength(a: number, b: number): number {
 
   const absoluteJump = far - near;
   const nearWeight = 1 - clamp(near / 65000, 0, 1);
-  return clamp((logJump - DEPTH_EDGE_LOG_THRESHOLD) / 1.15 + nearWeight * 0.14 + clamp(absoluteJump / 42000, 0, 0.22), 0, 1);
+  const jumpStrength = smoothstep((logJump - DEPTH_EDGE_LOG_THRESHOLD) / 1.15);
+  return clamp(jumpStrength + nearWeight * 0.14 + clamp(absoluteJump / 42000, 0, 0.22), 0, 1);
 }
 
 function drawSkyline(context: CanvasRenderingContext2D, profile: ProfilePoint[], width: number): void {

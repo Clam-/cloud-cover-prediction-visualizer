@@ -1,4 +1,5 @@
 import { clamp, localOffset, offsetLocation, seededRandom, lonLatToTile } from "../geo";
+import { sampleScalarGridSmooth, sampleTerrainGridElevation } from "../terrainSurface";
 import { fetchCachedBlob, readPersistentCacheMany, writePersistentCacheMany } from "./cache";
 import type { LocationPoint, Settings, TerrainGrid, TerrainSample } from "../types";
 
@@ -91,10 +92,15 @@ export function recenterTerrainGrid(grid: TerrainGrid, center: LocationPoint): T
       };
     })
   );
-  const groundElevation = sampleTerrainElevation(samples, 0, 0) ?? grid.groundElevation;
+  const recenteredGrid = {
+    ...grid,
+    center,
+    samples
+  };
+  const groundElevation = sampleTerrainGridElevation(recenteredGrid, 0, 0) ?? grid.groundElevation;
 
   return {
-    ...grid,
+    ...recenteredGrid,
     center: {
       ...center,
       elevation: groundElevation
@@ -248,15 +254,23 @@ async function sampleMapboxTerrain(points: TerrainPoint[], settings: Settings, s
     }
     const tile = lonLatToTile(point.lon, point.lat, zoom);
     const tileData = await loadMapboxTerrainTile(tile.x, tile.y, zoom, token, signal);
-    const px = clamp(Math.floor((tile.xf - tile.x) * tileData.width), 0, tileData.width - 1);
-    const py = clamp(Math.floor((tile.yf - tile.y) * tileData.height), 0, tileData.height - 1);
-    const index = (py * tileData.width + px) * 4;
-    const r = tileData.data[index];
-    const g = tileData.data[index + 1];
-    const b = tileData.data[index + 2];
-    elevations.push(-10000 + (r * 256 * 256 + g * 256 + b) * 0.1);
+    const px = clamp((tile.xf - tile.x) * (tileData.width - 1), 0, tileData.width - 1);
+    const py = clamp((tile.yf - tile.y) * (tileData.height - 1), 0, tileData.height - 1);
+    elevations.push(sampleMapboxTerrainTile(tileData, px, py));
   }
   return elevations;
+}
+
+function sampleMapboxTerrainTile(tile: TerrainTile, x: number, y: number): number {
+  return sampleScalarGridSmooth(tile.width, tile.height, (px, py) => decodeMapboxTerrainPixel(tile, px, py), x, y);
+}
+
+function decodeMapboxTerrainPixel(tile: TerrainTile, x: number, y: number): number {
+  const index = (y * tile.width + x) * 4;
+  const r = tile.data[index];
+  const g = tile.data[index + 1];
+  const b = tile.data[index + 2];
+  return -10000 + (r * 256 * 256 + g * 256 + b) * 0.1;
 }
 
 function loadMapboxTerrainTile(x: number, y: number, zoom: number, token: string, signal?: AbortSignal): Promise<TerrainTile> {
@@ -298,35 +312,6 @@ function loadMapboxTerrainTile(x: number, y: number, zoom: number, token: string
   mapboxTileCache.set(key, promise);
   evictMapboxTileCache();
   return promise;
-}
-
-function sampleTerrainElevation(samples: TerrainSample[][], east: number, north: number): number | undefined {
-  const closest: Array<{ distance: number; elevation: number }> = [];
-
-  for (const row of samples) {
-    for (const sample of row) {
-      const distance = Math.hypot(sample.east - east, sample.north - north);
-      if (distance < 1) {
-        return sample.elevation;
-      }
-      closest.push({ distance, elevation: sample.elevation });
-    }
-  }
-
-  closest.sort((a, b) => a.distance - b.distance);
-  const nearest = closest.slice(0, 4);
-  if (!nearest.length) {
-    return undefined;
-  }
-
-  let totalWeight = 0;
-  let weightedElevation = 0;
-  for (const item of nearest) {
-    const weight = 1 / Math.max(item.distance * item.distance, 1);
-    totalWeight += weight;
-    weightedElevation += item.elevation * weight;
-  }
-  return Math.round(weightedElevation / totalWeight);
 }
 
 function quantizeElevationPoint(point: Pick<LocationPoint, "lat" | "lon">): { lat: number; lon: number } {

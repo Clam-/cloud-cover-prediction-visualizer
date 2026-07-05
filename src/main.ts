@@ -22,6 +22,7 @@ import {
 import { MiniMap } from "./miniMap";
 import { PanoramaRenderer } from "./panorama";
 import { defaultSettings, loadSettings, resetSettings, saveSettings } from "./settings";
+import { projectedTerrainHeight, terrainSurfacePointAt, terrainSurfaceResolution } from "./terrainSurface";
 import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudVolume, CloudVolumeType, LocationPoint, Settings, TerrainGrid } from "./types";
 
 interface DragState {
@@ -654,7 +655,7 @@ class HorizonApp {
     this.terrainMesh = undefined;
     this.seaMesh = undefined;
 
-    const resolution = grid.resolution;
+    const resolution = terrainSurfaceResolution(grid);
     const positions = new Float32Array(resolution * resolution * 3);
     const colors = new Float32Array(resolution * resolution * 3);
     const indices: number[] = [];
@@ -665,8 +666,13 @@ class HorizonApp {
     for (let z = 0; z < resolution; z += 1) {
       for (let x = 0; x < resolution; x += 1) {
         const index = z * resolution + x;
-        const sample = grid.samples[z][x];
-        const y = (sample.elevation - grid.groundElevation) * this.settings.terrainVerticalScale;
+        const sample = terrainSurfacePointAt(grid, x, z, resolution);
+        if (!sample) {
+          continue;
+        }
+
+        const distance = Math.hypot(sample.east, sample.north);
+        const y = projectedTerrainHeight(sample.elevation, grid.groundElevation, distance, this.settings.terrainVerticalScale);
         positions[index * 3] = sample.east;
         positions[index * 3 + 1] = y;
         positions[index * 3 + 2] = worldZFromNorth(sample.north);
