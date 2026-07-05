@@ -6,13 +6,13 @@ const TERRAIN_VERTICAL_SCALE_MAX = 3;
 const MAX_API_KEY_LENGTH = 2048;
 
 const terrainSources = ["synthetic", "openMeteo", "mapbox"] as const satisfies readonly TerrainSource[];
-const cloudSources = ["synthetic", "openMeteo", "openWeather"] as const satisfies readonly CloudSource[];
+const cloudSources = ["synthetic", "openMeteo", "openMeteoGrid", "openWeather"] as const satisfies readonly CloudSource[];
 const geocoderSources = ["openMeteo", "nominatim", "mapbox"] as const satisfies readonly GeocoderSource[];
 const mapSources = ["terrainCanvas", "osmRaster", "mapboxRaster"] as const satisfies readonly MapSource[];
 
 export const defaultSettings: Settings = {
   terrainSource: "synthetic",
-  cloudSource: "openMeteo",
+  cloudSource: "openMeteoGrid",
   geocoderSource: "openMeteo",
   mapSource: "terrainCanvas",
   apiKeys: {

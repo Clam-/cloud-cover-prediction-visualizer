@@ -1,6 +1,6 @@
-import { clamp, hashNumber, seededRandom } from "../geo";
+import { clamp, hashNumber, offsetLocation, seededRandom } from "../geo";
 import { readPersistentCache, writePersistentCache } from "./cache";
-import type { CloudDataMode, CloudSnapshot, LocationPoint, Settings } from "../types";
+import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudVolume, LocationPoint, Settings } from "../types";
 
 interface OpenMeteoForecastBody {
   utc_offset_seconds?: number;
@@ -33,11 +33,55 @@ interface OpenWeatherBody {
   hourly?: Array<{ dt: number; clouds?: number }>;
 }
 
+interface OpenMeteoGridPointBody {
+  latitude?: number;
+  longitude?: number;
+  utc_offset_seconds?: number;
+  hourly?: OpenMeteoGridHourly;
+}
+
+interface OpenMeteoGridHourly {
+  time?: string[];
+  [key: string]: number[] | string[] | undefined;
+}
+
+interface CloudGridSample extends LocationPoint {
+  column: number;
+  east: number;
+  north: number;
+  row: number;
+}
+
+interface PressureCloudLevel {
+  altitudeMeters: number;
+  hpa: number;
+  layer: CloudLayer;
+  thicknessMeters: number;
+}
+
 const CLOUD_LOCATION_PRECISION = 4;
 const OPEN_METEO_FORECAST_TTL_MS = 6 * 60 * 60 * 1000;
 const OPEN_METEO_CURRENT_TTL_MS = 5 * 60 * 1000;
+const OPEN_METEO_GRID_TTL_MS = 90 * 60 * 1000;
 const OPEN_WEATHER_FORECAST_TTL_MS = 2 * 60 * 60 * 1000;
 const OPEN_WEATHER_CURRENT_TTL_MS = 10 * 60 * 1000;
+const CLOUD_GRID_RESOLUTION = 7;
+const CLOUD_GRID_SPACING_METERS = 12000;
+const MIN_GRID_VOLUME_COVER = 12;
+const PRESSURE_CLOUD_LEVELS: PressureCloudLevel[] = [
+  { hpa: 925, layer: "low", altitudeMeters: 800, thicknessMeters: 520 },
+  { hpa: 850, layer: "low", altitudeMeters: 1500, thicknessMeters: 720 },
+  { hpa: 700, layer: "mid", altitudeMeters: 3000, thicknessMeters: 1050 },
+  { hpa: 500, layer: "mid", altitudeMeters: 5600, thicknessMeters: 1350 },
+  { hpa: 300, layer: "high", altitudeMeters: 9200, thicknessMeters: 1550 }
+];
+const OPEN_METEO_GRID_HOURLY_VARIABLES = [
+  "cloud_cover",
+  "cloud_cover_low",
+  "cloud_cover_mid",
+  "cloud_cover_high",
+  ...PRESSURE_CLOUD_LEVELS.flatMap((level) => [`cloud_cover_${level.hpa}hPa`, `geopotential_height_${level.hpa}hPa`])
+];
 
 export async function loadCloudSnapshot(
   location: LocationPoint,
@@ -51,6 +95,9 @@ export async function loadCloudSnapshot(
   }
 
   try {
+    if (settings.cloudSource === "openMeteoGrid") {
+      return await loadOpenMeteoGridClouds(location, time, settings, signal, mode);
+    }
     if (settings.cloudSource === "openMeteo") {
       return mode === "realtime"
         ? await loadOpenMeteoCurrentClouds(location, time, settings, signal)
@@ -70,6 +117,107 @@ export async function loadCloudSnapshot(
       warning
     };
   }
+}
+
+async function loadOpenMeteoGridClouds(
+  location: LocationPoint,
+  time: Date,
+  settings: Settings,
+  signal?: AbortSignal,
+  mode: CloudDataMode = "prediction"
+): Promise<CloudSnapshot> {
+  const endpoint = settings.apiKeys.openMeteo
+    ? "https://customer-api.open-meteo.com/v1/forecast"
+    : "https://api.open-meteo.com/v1/forecast";
+  const samples = buildCloudGridSamples(location);
+  const targetHour = formatOpenMeteoUtcHour(time);
+  const params = new URLSearchParams({
+    latitude: samples.map((sample) => sample.lat.toFixed(5)).join(","),
+    longitude: samples.map((sample) => sample.lon.toFixed(5)).join(","),
+    hourly: OPEN_METEO_GRID_HOURLY_VARIABLES.join(","),
+    start_hour: targetHour,
+    end_hour: targetHour,
+    timezone: "GMT",
+    cell_selection: "nearest"
+  });
+  if (settings.apiKeys.openMeteo) {
+    params.set("apikey", settings.apiKeys.openMeteo);
+  }
+
+  const url = `${endpoint}?${params.toString()}`;
+  const body = await loadCachedJson<OpenMeteoGridPointBody | OpenMeteoGridPointBody[]>(
+    openMeteoGridCacheKey(location, targetHour, settings.apiKeys.openMeteo, url),
+    OPEN_METEO_GRID_TTL_MS,
+    url,
+    signal,
+    "Open-Meteo cloud grid"
+  );
+  const points = Array.isArray(body) ? body : [body];
+  if (!points.length) {
+    throw new Error("Open-Meteo grid response did not include cloud fields");
+  }
+
+  const totals: number[] = [];
+  const lows: number[] = [];
+  const mids: number[] = [];
+  const highs: number[] = [];
+  const volumes: CloudVolume[] = [];
+
+  points.forEach((point, index) => {
+    const sample = samples[index];
+    const hourly = point.hourly;
+    if (!sample || !hourly?.time?.length) {
+      return;
+    }
+    const offsetMs = (point.utc_offset_seconds ?? 0) * 1000;
+    const bestIndex = closestOpenMeteoHourlyIndex(hourly.time, time.getTime(), offsetMs);
+    pushDefinedPercent(totals, readHourlyPercent(hourly, "cloud_cover", bestIndex));
+    pushDefinedPercent(lows, readHourlyPercent(hourly, "cloud_cover_low", bestIndex));
+    pushDefinedPercent(mids, readHourlyPercent(hourly, "cloud_cover_mid", bestIndex));
+    pushDefinedPercent(highs, readHourlyPercent(hourly, "cloud_cover_high", bestIndex));
+
+    for (const level of PRESSURE_CLOUD_LEVELS) {
+      const cover = readHourlyPercent(hourly, `cloud_cover_${level.hpa}hPa`, bestIndex);
+      if (cover === undefined || cover < MIN_GRID_VOLUME_COVER) {
+        continue;
+      }
+      const altitude = readHourlyNumber(hourly, `geopotential_height_${level.hpa}hPa`, bestIndex) ?? level.altitudeMeters;
+      const radius = CLOUD_GRID_SPACING_METERS * clamp(0.32 + cover / 165, 0.38, 0.88);
+      const thickness = level.thicknessMeters * clamp(0.72 + cover / 150, 0.76, 1.34);
+      volumes.push({
+        lat: sample.lat,
+        lon: sample.lon,
+        east: sample.east,
+        north: sample.north,
+        cover,
+        altitudeMeters: altitude,
+        altitudeReference: "seaLevel",
+        radiusMeters: radius,
+        thicknessMeters: thickness,
+        layer: level.layer
+      });
+    }
+  });
+
+  if (!totals.length && !volumes.length) {
+    throw new Error("Open-Meteo grid response did not include usable cloud pixels");
+  }
+
+  return {
+    time,
+    dataMode: mode,
+    total: averagePercent(totals.length ? totals : volumes.map((volume) => volume.cover)),
+    low: averagePercent(lows.length ? lows : volumes.filter((volume) => volume.layer === "low").map((volume) => volume.cover)),
+    mid: averagePercent(mids.length ? mids : volumes.filter((volume) => volume.layer === "mid").map((volume) => volume.cover)),
+    high: averagePercent(highs.length ? highs : volumes.filter((volume) => volume.layer === "high").map((volume) => volume.cover)),
+    sourceLabel: mode === "realtime" ? "Open-Meteo Current Grid" : "Open-Meteo Forecast Grid",
+    map: {
+      radiusMeters: CLOUD_GRID_SPACING_METERS * Math.floor(CLOUD_GRID_RESOLUTION / 2),
+      resolution: CLOUD_GRID_RESOLUTION,
+      spacingMeters: CLOUD_GRID_SPACING_METERS,
+      volumes
+    }
+  };
 }
 
 function syntheticClouds(location: LocationPoint, time: Date, mode: CloudDataMode): CloudSnapshot {
@@ -243,6 +391,56 @@ function readPercent(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? clamp(Math.round(value), 0, 100) : undefined;
 }
 
+function readHourlyPercent(hourly: OpenMeteoGridHourly, key: string, index: number): number | undefined {
+  return readPercent(readHourlyNumber(hourly, key, index));
+}
+
+function readHourlyNumber(hourly: OpenMeteoGridHourly, key: string, index: number): number | undefined {
+  const values = hourly[key];
+  const value = Array.isArray(values) ? values[index] : undefined;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function pushDefinedPercent(values: number[], value: number | undefined): void {
+  if (value !== undefined) {
+    values.push(value);
+  }
+}
+
+function averagePercent(values: number[]): number {
+  if (!values.length) {
+    return 0;
+  }
+  return clamp(Math.round(values.reduce((sum, value) => sum + value, 0) / values.length), 0, 100);
+}
+
+function buildCloudGridSamples(location: LocationPoint): CloudGridSample[] {
+  const samples: CloudGridSample[] = [];
+  const half = Math.floor(CLOUD_GRID_RESOLUTION / 2);
+  for (let row = 0; row < CLOUD_GRID_RESOLUTION; row += 1) {
+    for (let column = 0; column < CLOUD_GRID_RESOLUTION; column += 1) {
+      const east = (column - half) * CLOUD_GRID_SPACING_METERS;
+      const north = (half - row) * CLOUD_GRID_SPACING_METERS;
+      samples.push({
+        ...offsetLocation(location, east, north),
+        column,
+        east,
+        north,
+        row
+      });
+    }
+  }
+  return samples;
+}
+
+function formatOpenMeteoUtcHour(time: Date): string {
+  const year = time.getUTCFullYear();
+  const month = String(time.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(time.getUTCDate()).padStart(2, "0");
+  const hour = String(time.getUTCHours()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hour}:00`;
+}
+
 function closestOpenMeteoHourlyIndex(times: string[], targetMs: number, offsetMs: number): number {
   let bestIndex = 0;
   let bestDistance = Number.POSITIVE_INFINITY;
@@ -293,10 +491,25 @@ function cloudCacheKey(source: string, location: LocationPoint, credential: stri
   return ["cloud", source, credentialFingerprint(credential), cloudLocationBucket(location)].join(":");
 }
 
+function openMeteoGridCacheKey(location: LocationPoint, targetHour: string, credential: string, url: string): string {
+  return [
+    "cloud",
+    "openMeteoGrid",
+    credentialFingerprint(credential),
+    targetHour,
+    cloudPreciseLocationBucket(location),
+    hashNumber(url).toString(36)
+  ].join(":");
+}
+
 function cloudLocationBucket(location: LocationPoint): string {
   const lat = Math.round(location.lat * CLOUD_LOCATION_PRECISION) / CLOUD_LOCATION_PRECISION;
   const lon = Math.round(location.lon * CLOUD_LOCATION_PRECISION) / CLOUD_LOCATION_PRECISION;
   return `${lat.toFixed(1)},${lon.toFixed(1)}`;
+}
+
+function cloudPreciseLocationBucket(location: LocationPoint): string {
+  return `${location.lat.toFixed(3)},${location.lon.toFixed(3)}`;
 }
 
 function credentialFingerprint(credential: string): string {

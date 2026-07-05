@@ -16,7 +16,7 @@ Open the local Vite URL shown by the dev server.
 - Starts at browser geolocation when permission is available, then tries IP-derived location, then falls back to Phillip Island, Victoria.
 - Renders a first-person terrain horizon with a camera looking east by default.
 - Supports mouse-drag camera look controls, FOV control, height offset from terrain from -300 m to +300 m, hourly time jumps, and terrain click-to-warp.
-- Draws procedural cloud layers from cloud prediction data at low, mid, and high altitudes.
+- Draws mapped cloud volumes from gridded forecast pixels when available, with procedural layers as a fallback for percentage-only sources.
 - Places the Sun and Moon for the selected location and visualized time.
 - Provides a resizable top-down map and a Settings modal for choosing data sources and API keys.
 
@@ -33,7 +33,8 @@ The app runs without paid accounts by using synthetic terrain as a guaranteed fa
 ### Clouds
 
 - Synthetic forecast: no account. Useful for offline development.
-- Open-Meteo Forecast: no account for non-commercial use. The app requests hourly `cloud_cover`, `cloud_cover_low`, `cloud_cover_mid`, and `cloud_cover_high`.
+- Open-Meteo Forecast Grid: no account for non-commercial use. The app samples a 7 x 7 coordinate grid around the viewpoint for the selected hour, requesting total/low/mid/high cloud cover plus pressure-level `cloud_cover_*hPa` and `geopotential_height_*hPa` fields. Pressure-level pixels are rendered as anchored cloud volumes at their estimated heights.
+- Open-Meteo Point Forecast: no account for non-commercial use. The app requests hourly `cloud_cover`, `cloud_cover_low`, `cloud_cover_mid`, and `cloud_cover_high` for the viewpoint only.
 - OpenWeather One Call: requires an OpenWeather API key with One Call API access. The app uses the nearest hourly `clouds` percentage and distributes it across visual cloud layers.
 
 ### Search
@@ -55,6 +56,7 @@ The app runs without paid accounts by using synthetic terrain as a guaranteed fa
 1. For non-commercial use, leave the Open-Meteo key blank.
 2. For commercial or reserved API resources, create an Open-Meteo customer account and put the key in Settings.
 3. The app switches customer calls to the `customer-api` or `customer-geocoding-api` host when the key is set.
+4. Select Open-Meteo Forecast Grid for spatial cloud placement, or Open-Meteo Point Forecast for the lighter percentage-only request.
 
 Docs:
 

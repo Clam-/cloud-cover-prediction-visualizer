@@ -21,7 +21,7 @@ import {
 import { MiniMap } from "./miniMap";
 import { PanoramaRenderer } from "./panorama";
 import { defaultSettings, loadSettings, resetSettings, saveSettings } from "./settings";
-import type { CloudDataMode, CloudSnapshot, LocationPoint, Settings, TerrainGrid } from "./types";
+import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudVolume, LocationPoint, Settings, TerrainGrid } from "./types";
 
 interface DragState {
   pointerId: number;
@@ -46,6 +46,11 @@ interface InitialRoute {
   location: LocationPoint;
   pitch?: number;
   yaw?: number;
+}
+
+interface CloudPuffSpec {
+  color: THREE.Color;
+  matrix: THREE.Matrix4;
 }
 
 const canvas = element<HTMLCanvasElement>("scene");
@@ -98,6 +103,38 @@ const TERRAIN_REUSE_RADIUS_FRACTION = 0.55;
 const CLOUD_RELOAD_DEBOUNCE_MS = 500;
 const REALTIME_CLOUD_REFRESH_MS = 5 * 60 * 1000;
 const CLOUD_REUSE_DISTANCE_METERS = 30000;
+const CLOUD_VOLUME_STYLES = {
+  low: {
+    color: "#d7e4e2",
+    opacity: 0.24,
+    renderOrder: 3,
+    horizontalScale: 1,
+    verticalScale: 1
+  },
+  mid: {
+    color: "#e3dfd1",
+    opacity: 0.2,
+    renderOrder: 2,
+    horizontalScale: 1.16,
+    verticalScale: 0.82
+  },
+  high: {
+    color: "#f2ebd4",
+    opacity: 0.15,
+    renderOrder: 1,
+    horizontalScale: 1.45,
+    verticalScale: 0.58
+  }
+} as const satisfies Record<
+  CloudLayer,
+  {
+    color: string;
+    horizontalScale: number;
+    opacity: number;
+    renderOrder: number;
+    verticalScale: number;
+  }
+>;
 
 class HorizonApp {
   private readonly renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -667,6 +704,11 @@ class HorizonApp {
 
   private buildClouds(snapshot: CloudSnapshot): void {
     this.disposeGroupChildren(this.cloudGroup);
+    if (snapshot.map?.volumes.length) {
+      this.buildMappedCloudVolumes(snapshot);
+      return;
+    }
+
     const layers = [
       { name: "low", cover: snapshot.low, altitude: 1200, max: 26, scale: [2100, 640] },
       { name: "mid", cover: snapshot.mid, altitude: 4300, max: 28, scale: [3100, 760] },
@@ -691,9 +733,96 @@ class HorizonApp {
         );
         sprite.position.set(Math.sin(angle) * radius, layer.altitude + random() * 800, Math.cos(angle) * radius);
         sprite.scale.set(layer.scale[0] * (0.65 + random() * 0.9), layer.scale[1] * (0.7 + random() * 0.8), 1);
+        sprite.userData.drift = true;
         this.cloudGroup.add(sprite);
       }
     }
+  }
+
+  private buildMappedCloudVolumes(snapshot: CloudSnapshot): void {
+    const map = snapshot.map;
+    if (!map?.volumes.length) {
+      return;
+    }
+
+    const geometry = new THREE.SphereGeometry(1, 16, 8);
+    const specsByLayer: Record<CloudLayer, CloudPuffSpec[]> = {
+      low: [],
+      mid: [],
+      high: []
+    };
+
+    map.volumes.forEach((volume) => {
+      this.cloudVolumePuffSpecs(volume, snapshot.time).forEach((spec) => {
+        specsByLayer[volume.layer].push(spec);
+      });
+    });
+
+    (Object.keys(specsByLayer) as CloudLayer[]).forEach((layer) => {
+      const specs = specsByLayer[layer];
+      if (!specs.length) {
+        return;
+      }
+      const style = CLOUD_VOLUME_STYLES[layer];
+      const material = new THREE.MeshStandardMaterial({
+        color: style.color,
+        depthWrite: false,
+        opacity: style.opacity,
+        roughness: 1,
+        side: THREE.DoubleSide,
+        transparent: true,
+        vertexColors: true
+      });
+      const mesh = new THREE.InstancedMesh(geometry, material, specs.length);
+      mesh.name = `${layer}-forecast-cloud-volumes`;
+      mesh.frustumCulled = false;
+      mesh.renderOrder = style.renderOrder;
+      mesh.userData.drift = false;
+      specs.forEach((spec, index) => {
+        mesh.setMatrixAt(index, spec.matrix);
+        mesh.setColorAt(index, spec.color);
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) {
+        mesh.instanceColor.needsUpdate = true;
+      }
+      this.cloudGroup.add(mesh);
+    });
+  }
+
+  private cloudVolumePuffSpecs(volume: CloudVolume, time: Date): CloudPuffSpec[] {
+    const style = CLOUD_VOLUME_STYLES[volume.layer];
+    const random = seededRandom(
+      `${volume.lat.toFixed(3)}:${volume.lon.toFixed(3)}:${volume.altitudeMeters.toFixed(0)}:${time.toISOString()}:${volume.layer}`
+    );
+    const puffCount = clamp(Math.round(1 + volume.cover / 42), 1, 3);
+    const specs: CloudPuffSpec[] = [];
+    const baseAltitude =
+      volume.altitudeReference === "seaLevel" ? volume.altitudeMeters - this.terrainElevation() : volume.altitudeMeters;
+    const altitude = clamp(baseAltitude, 180, 14500);
+    const baseColor = new THREE.Color(style.color);
+
+    for (let index = 0; index < puffCount; index += 1) {
+      const angle = random() * Math.PI * 2;
+      const spread = index === 0 ? 0 : volume.radiusMeters * (0.18 + random() * 0.28);
+      const position = new THREE.Vector3(
+        volume.east + Math.cos(angle) * spread,
+        altitude + (random() - 0.5) * volume.thicknessMeters * 0.45,
+        volume.north + Math.sin(angle) * spread
+      );
+      const horizontalDensity = 0.74 + volume.cover / 180;
+      const scale = new THREE.Vector3(
+        volume.radiusMeters * style.horizontalScale * horizontalDensity * (0.74 + random() * 0.56),
+        volume.thicknessMeters * style.verticalScale * (0.2 + volume.cover / 260) * (0.72 + random() * 0.52),
+        volume.radiusMeters * style.horizontalScale * horizontalDensity * (0.62 + random() * 0.64)
+      );
+      const quaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, random() * Math.PI, 0));
+      const matrix = new THREE.Matrix4().compose(position, quaternion, scale);
+      const color = baseColor.clone().offsetHSL(0, 0, (random() - 0.5) * 0.08);
+      specs.push({ color, matrix });
+    }
+
+    return specs;
   }
 
   private getCloudTexture(): THREE.Texture {
@@ -1008,6 +1137,9 @@ class HorizonApp {
     if (!this.clouds || this.cloudDataKey !== cloudDataKey || this.clouds.dataMode !== requestedMode) {
       return undefined;
     }
+    if (this.clouds.map && distanceMeters(previousLocation, nextLocation) > 250) {
+      return undefined;
+    }
     if (distanceMeters(previousLocation, nextLocation) > CLOUD_REUSE_DISTANCE_METERS) {
       return undefined;
     }
@@ -1177,6 +1309,9 @@ class HorizonApp {
     this.timer.update(timestamp);
     const elapsed = this.timer.getElapsed();
     this.cloudGroup.children.forEach((cloud, index) => {
+      if (cloud.userData.drift === false) {
+        return;
+      }
       cloud.position.x += Math.sin(elapsed * 0.08 + index) * 0.12;
     });
     this.renderer.render(this.scene, this.camera);

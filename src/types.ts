@@ -1,8 +1,9 @@
 export type TerrainSource = "synthetic" | "openMeteo" | "mapbox";
-export type CloudSource = "synthetic" | "openMeteo" | "openWeather";
+export type CloudSource = "synthetic" | "openMeteo" | "openMeteoGrid" | "openWeather";
 export type CloudDataMode = "realtime" | "prediction";
 export type GeocoderSource = "openMeteo" | "nominatim" | "mapbox";
 export type MapSource = "terrainCanvas" | "osmRaster" | "mapboxRaster";
+export type CloudLayer = "low" | "mid" | "high";
 
 export interface LocationPoint {
   lat: number;
@@ -52,5 +53,26 @@ export interface CloudSnapshot {
   mid: number;
   high: number;
   sourceLabel: string;
+  map?: CloudVolumeMap;
   warning?: string;
+}
+
+export interface CloudVolume {
+  lat: number;
+  lon: number;
+  east: number;
+  north: number;
+  cover: number;
+  altitudeMeters: number;
+  altitudeReference: "seaLevel";
+  radiusMeters: number;
+  thicknessMeters: number;
+  layer: CloudLayer;
+}
+
+export interface CloudVolumeMap {
+  radiusMeters: number;
+  resolution: number;
+  spacingMeters: number;
+  volumes: CloudVolume[];
 }
