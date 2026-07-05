@@ -29,6 +29,18 @@ interface PressureCloudLevel {
   thicknessMeters: number;
 }
 
+interface ApproximateCloudLayer {
+  altitudeMeters: number;
+  layer: CloudLayer;
+  thicknessMeters: number;
+}
+
+interface LayerCloudSample {
+  cover: number;
+  layer: CloudLayer;
+  sample: CloudGridSample;
+}
+
 interface OpenMeteoCloudSourceConfig {
   endpointPath: string;
   hourlyVariables: string[];
@@ -48,6 +60,11 @@ const PRESSURE_CLOUD_LEVELS: PressureCloudLevel[] = [
   { hpa: 700, layer: "mid", altitudeMeters: 3000, thicknessMeters: 1050 },
   { hpa: 500, layer: "mid", altitudeMeters: 5600, thicknessMeters: 1350 },
   { hpa: 300, layer: "high", altitudeMeters: 9200, thicknessMeters: 1550 }
+];
+const APPROXIMATE_CLOUD_LAYERS: ApproximateCloudLayer[] = [
+  { layer: "low", altitudeMeters: 1200, thicknessMeters: 850 },
+  { layer: "mid", altitudeMeters: 4200, thicknessMeters: 1300 },
+  { layer: "high", altitudeMeters: 8300, thicknessMeters: 1600 }
 ];
 const OPEN_METEO_GRID_HOURLY_VARIABLES = [
   "cloud_cover",
@@ -136,7 +153,8 @@ async function loadHrrrZarrCloudsWithGlobalFallback(
   settings: Settings
 ): Promise<CloudSnapshot> {
   if (!hrrrZarrCoversLocation(location)) {
-    return loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+    const fallback = await loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+    return withCloudWarning(fallback, "NOAA HRRR Zarr covers the contiguous United States only");
   }
 
   try {
@@ -145,7 +163,13 @@ async function loadHrrrZarrCloudsWithGlobalFallback(
     if (isAbortError(error, signal)) {
       throw error;
     }
-    return loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+    const warning = errorMessage(error, "NOAA HRRR Zarr cloud grid failed");
+    try {
+      const fallback = await loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+      return withCloudWarning(fallback, warning);
+    } catch (fallbackError) {
+      throw new Error(`${warning}; fallback failed: ${errorMessage(fallbackError, "Open-Meteo ECMWF IFS cloud grid failed")}`);
+    }
   }
 }
 
@@ -163,7 +187,13 @@ async function loadOpenMeteoCloudsWithGlobalFallback(
     if (isAbortError(error, signal)) {
       throw error;
     }
-    return loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+    const warning = errorMessage(error, `${config.sourceLabel} failed`);
+    try {
+      const fallback = await loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+      return withCloudWarning(fallback, warning);
+    } catch (fallbackError) {
+      throw new Error(`${warning}; fallback failed: ${errorMessage(fallbackError, "Open-Meteo ECMWF IFS cloud grid failed")}`);
+    }
   }
 }
 
@@ -214,6 +244,8 @@ async function loadOpenMeteoGridClouds(
   const mids: number[] = [];
   const highs: number[] = [];
   const volumes: CloudVolume[] = [];
+  const layerSamples: LayerCloudSample[] = [];
+  const modeledLayerKeys = new Set<string>();
 
   points.forEach((point, index) => {
     const sample = samples[index];
@@ -224,9 +256,15 @@ async function loadOpenMeteoGridClouds(
     const offsetMs = (point.utc_offset_seconds ?? 0) * 1000;
     const bestIndex = closestOpenMeteoHourlyIndex(hourly.time, time.getTime(), offsetMs);
     pushDefinedPercent(totals, readHourlyPercent(hourly, "cloud_cover", bestIndex));
-    pushDefinedPercent(lows, readHourlyPercent(hourly, "cloud_cover_low", bestIndex));
-    pushDefinedPercent(mids, readHourlyPercent(hourly, "cloud_cover_mid", bestIndex));
-    pushDefinedPercent(highs, readHourlyPercent(hourly, "cloud_cover_high", bestIndex));
+    const low = readHourlyPercent(hourly, "cloud_cover_low", bestIndex);
+    const mid = readHourlyPercent(hourly, "cloud_cover_mid", bestIndex);
+    const high = readHourlyPercent(hourly, "cloud_cover_high", bestIndex);
+    pushDefinedPercent(lows, low);
+    pushDefinedPercent(mids, mid);
+    pushDefinedPercent(highs, high);
+    pushLayerSample(layerSamples, sample, "low", low);
+    pushLayerSample(layerSamples, sample, "mid", mid);
+    pushLayerSample(layerSamples, sample, "high", high);
 
     for (const level of PRESSURE_CLOUD_LEVELS) {
       const cover = readHourlyPercent(hourly, `cloud_cover_${level.hpa}hPa`, bestIndex);
@@ -246,15 +284,20 @@ async function loadOpenMeteoGridClouds(
         altitudeReference: "seaLevel",
         radiusMeters: radius,
         thicknessMeters: thickness,
-        layer: level.layer
+        layer: level.layer,
+        volumeType: "modeled"
       });
+      modeledLayerKeys.add(layerSampleKey(sample, level.layer));
     }
   });
+  const approximateVolumes = buildApproximateLayerVolumes(layerSamples, modeledLayerKeys);
+  volumes.push(...approximateVolumes);
 
   if (!totals.length && !volumes.length) {
     throw new Error("Open-Meteo grid response did not include usable cloud pixels");
   }
 
+  const warning = openMeteoApproximateVolumeWarning(config, points, approximateVolumes);
   return {
     time,
     dataMode: mode,
@@ -268,7 +311,8 @@ async function loadOpenMeteoGridClouds(
       resolution: CLOUD_GRID_RESOLUTION,
       spacingMeters: CLOUD_GRID_SPACING_METERS,
       volumes
-    }
+    },
+    ...(warning ? { warning } : {})
   };
 }
 
@@ -316,6 +360,75 @@ function averagePercent(values: number[]): number {
     return 0;
   }
   return clamp(Math.round(values.reduce((sum, value) => sum + value, 0) / values.length), 0, 100);
+}
+
+function pushLayerSample(
+  layerSamples: LayerCloudSample[],
+  sample: CloudGridSample,
+  layer: CloudLayer,
+  cover: number | undefined
+): void {
+  if (cover !== undefined && cover >= MIN_GRID_VOLUME_COVER) {
+    layerSamples.push({ sample, layer, cover });
+  }
+}
+
+function buildApproximateLayerVolumes(layerSamples: LayerCloudSample[], modeledLayerKeys: Set<string>): CloudVolume[] {
+  return layerSamples
+    .filter(({ layer, sample }) => !modeledLayerKeys.has(layerSampleKey(sample, layer)))
+    .map(({ cover, layer, sample }) => {
+      const approximateLayer = APPROXIMATE_CLOUD_LAYERS.find((candidate) => candidate.layer === layer);
+      const altitudeMeters = approximateLayer?.altitudeMeters ?? 4200;
+      const baseThickness = approximateLayer?.thicknessMeters ?? 1100;
+      return {
+        lat: sample.lat,
+        lon: sample.lon,
+        east: sample.east,
+        north: sample.north,
+        cover,
+        altitudeMeters,
+        altitudeReference: "seaLevel",
+        radiusMeters: CLOUD_GRID_SPACING_METERS * clamp(0.28 + cover / 170, 0.36, 0.84),
+        thicknessMeters: baseThickness * clamp(0.72 + cover / 150, 0.76, 1.34),
+        layer,
+        volumeType: "approximate"
+      };
+    });
+}
+
+function layerSampleKey(sample: CloudGridSample, layer: CloudLayer): string {
+  return `${sample.row}:${sample.column}:${layer}`;
+}
+
+function openMeteoApproximateVolumeWarning(
+  config: OpenMeteoCloudSourceConfig,
+  points: OpenMeteoGridPointBody[],
+  approximateVolumes: CloudVolume[]
+): string | undefined {
+  if (!approximateVolumes.length) {
+    return undefined;
+  }
+  if (!config.hourlyVariables.some(isPressureCloudVariable)) {
+    return `${config.sourceLabel} provides layer cloud percentages only, so approximate layer volumes are shown in magenta`;
+  }
+  const hasPressureLevelFields = points.some((point) =>
+    PRESSURE_CLOUD_LEVELS.some((level) => Array.isArray(point.hourly?.[`cloud_cover_${level.hpa}hPa`]))
+  );
+  if (!hasPressureLevelFields) {
+    return `${config.sourceLabel} did not return pressure-level cloud fields, so approximate layer volumes are shown in magenta`;
+  }
+  return `${config.sourceLabel} has layer cloud cover without matching pressure-level volume pixels, so approximate layer volumes are shown in magenta`;
+}
+
+function isPressureCloudVariable(variable: string): boolean {
+  return /^cloud_cover_\d+hPa$/.test(variable);
+}
+
+function withCloudWarning(snapshot: CloudSnapshot, warning: string): CloudSnapshot {
+  return {
+    ...snapshot,
+    warning: snapshot.warning ? `${warning}; ${snapshot.warning}` : warning
+  };
 }
 
 function buildCloudGridSamples(location: LocationPoint): CloudGridSample[] {
@@ -409,6 +522,10 @@ function cloudPreciseLocationBucket(location: LocationPoint): string {
 function credentialFingerprint(credential: string): string {
   const trimmed = credential.trim();
   return trimmed ? hashNumber(trimmed).toString(36) : "public";
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }
 
 function isAbortError(error: unknown, signal?: AbortSignal): boolean {

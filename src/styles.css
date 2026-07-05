@@ -487,6 +487,42 @@ select:focus-visible {
   color: #c7e4ff;
 }
 
+.cloud-volume-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 246, 210, 0.84);
+}
+
+.cloud-volume-key-label {
+  color: rgba(255, 246, 210, 0.92);
+}
+
+.cloud-volume-key-item {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.cloud-volume-swatch {
+  width: 12px;
+  height: 8px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.36);
+}
+
+.cloud-volume-swatch-modeled {
+  background: #d7e4e2;
+}
+
+.cloud-volume-swatch-approximate {
+  background: #ff4fb8;
+}
+
 @media (max-width: 1120px) and (min-width: 761px) {
   .data-mode-control {
     bottom: 132px;

@@ -22,7 +22,7 @@ import {
 import { MiniMap } from "./miniMap";
 import { PanoramaRenderer } from "./panorama";
 import { defaultSettings, loadSettings, resetSettings, saveSettings } from "./settings";
-import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudVolume, LocationPoint, Settings, TerrainGrid } from "./types";
+import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudVolume, CloudVolumeType, LocationPoint, Settings, TerrainGrid } from "./types";
 
 interface DragState {
   pointerId: number;
@@ -52,6 +52,14 @@ interface InitialRoute {
 interface CloudPuffSpec {
   color: THREE.Color;
   matrix: THREE.Matrix4;
+}
+
+interface CloudVolumeStyle {
+  color: string;
+  horizontalScale: number;
+  opacity: number;
+  renderOrder: number;
+  verticalScale: number;
 }
 
 const canvas = element<HTMLCanvasElement>("scene");
@@ -103,38 +111,55 @@ const TERRAIN_REUSE_RADIUS_FRACTION = 0.55;
 const CLOUD_RELOAD_DEBOUNCE_MS = 500;
 const REALTIME_CLOUD_REFRESH_MS = 5 * 60 * 1000;
 const CLOUD_REUSE_DISTANCE_METERS = 30000;
+const CLOUD_VOLUME_TYPES: CloudVolumeType[] = ["modeled", "approximate"];
 const CLOUD_VOLUME_STYLES = {
-  low: {
-    color: "#d7e4e2",
-    opacity: 0.24,
-    renderOrder: 3,
-    horizontalScale: 1,
-    verticalScale: 1
+  modeled: {
+    low: {
+      color: "#d7e4e2",
+      opacity: 0.24,
+      renderOrder: 3,
+      horizontalScale: 1,
+      verticalScale: 1
+    },
+    mid: {
+      color: "#e3dfd1",
+      opacity: 0.2,
+      renderOrder: 2,
+      horizontalScale: 1.16,
+      verticalScale: 0.82
+    },
+    high: {
+      color: "#f2ebd4",
+      opacity: 0.15,
+      renderOrder: 1,
+      horizontalScale: 1.45,
+      verticalScale: 0.58
+    }
   },
-  mid: {
-    color: "#e3dfd1",
-    opacity: 0.2,
-    renderOrder: 2,
-    horizontalScale: 1.16,
-    verticalScale: 0.82
-  },
-  high: {
-    color: "#f2ebd4",
-    opacity: 0.15,
-    renderOrder: 1,
-    horizontalScale: 1.45,
-    verticalScale: 0.58
+  approximate: {
+    low: {
+      color: "#ff4fb8",
+      opacity: 0.2,
+      renderOrder: 6,
+      horizontalScale: 0.92,
+      verticalScale: 1.04
+    },
+    mid: {
+      color: "#ff4fb8",
+      opacity: 0.17,
+      renderOrder: 5,
+      horizontalScale: 1.08,
+      verticalScale: 0.86
+    },
+    high: {
+      color: "#ff4fb8",
+      opacity: 0.14,
+      renderOrder: 4,
+      horizontalScale: 1.32,
+      verticalScale: 0.62
+    }
   }
-} as const satisfies Record<
-  CloudLayer,
-  {
-    color: string;
-    horizontalScale: number;
-    opacity: number;
-    renderOrder: number;
-    verticalScale: number;
-  }
->;
+} as const satisfies Record<CloudVolumeType, Record<CloudLayer, CloudVolumeStyle>>;
 
 class HorizonApp {
   private readonly renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -746,54 +771,63 @@ class HorizonApp {
     }
 
     const geometry = new THREE.SphereGeometry(1, 16, 8);
-    const specsByLayer: Record<CloudLayer, CloudPuffSpec[]> = {
-      low: [],
-      mid: [],
-      high: []
+    const specsByTypeAndLayer: Record<CloudVolumeType, Record<CloudLayer, CloudPuffSpec[]>> = {
+      modeled: {
+        low: [],
+        mid: [],
+        high: []
+      },
+      approximate: {
+        low: [],
+        mid: [],
+        high: []
+      }
     };
 
     map.volumes.forEach((volume) => {
       this.cloudVolumePuffSpecs(volume, snapshot.time).forEach((spec) => {
-        specsByLayer[volume.layer].push(spec);
+        specsByTypeAndLayer[cloudVolumeType(volume)][volume.layer].push(spec);
       });
     });
 
-    (Object.keys(specsByLayer) as CloudLayer[]).forEach((layer) => {
-      const specs = specsByLayer[layer];
-      if (!specs.length) {
-        return;
-      }
-      const style = CLOUD_VOLUME_STYLES[layer];
-      const material = new THREE.MeshStandardMaterial({
-        color: style.color,
-        depthWrite: false,
-        opacity: style.opacity,
-        roughness: 1,
-        side: THREE.DoubleSide,
-        transparent: true,
-        vertexColors: true
+    CLOUD_VOLUME_TYPES.forEach((volumeType) => {
+      (Object.keys(specsByTypeAndLayer[volumeType]) as CloudLayer[]).forEach((layer) => {
+        const specs = specsByTypeAndLayer[volumeType][layer];
+        if (!specs.length) {
+          return;
+        }
+        const style = CLOUD_VOLUME_STYLES[volumeType][layer];
+        const material = new THREE.MeshStandardMaterial({
+          color: style.color,
+          depthWrite: false,
+          opacity: style.opacity,
+          roughness: 1,
+          side: THREE.DoubleSide,
+          transparent: true,
+          vertexColors: true
+        });
+        const mesh = new THREE.InstancedMesh(geometry, material, specs.length);
+        mesh.name = `${volumeType}-${layer}-forecast-cloud-volumes`;
+        mesh.frustumCulled = false;
+        mesh.renderOrder = style.renderOrder;
+        mesh.userData.drift = false;
+        specs.forEach((spec, index) => {
+          mesh.setMatrixAt(index, spec.matrix);
+          mesh.setColorAt(index, spec.color);
+        });
+        mesh.instanceMatrix.needsUpdate = true;
+        if (mesh.instanceColor) {
+          mesh.instanceColor.needsUpdate = true;
+        }
+        this.cloudGroup.add(mesh);
       });
-      const mesh = new THREE.InstancedMesh(geometry, material, specs.length);
-      mesh.name = `${layer}-forecast-cloud-volumes`;
-      mesh.frustumCulled = false;
-      mesh.renderOrder = style.renderOrder;
-      mesh.userData.drift = false;
-      specs.forEach((spec, index) => {
-        mesh.setMatrixAt(index, spec.matrix);
-        mesh.setColorAt(index, spec.color);
-      });
-      mesh.instanceMatrix.needsUpdate = true;
-      if (mesh.instanceColor) {
-        mesh.instanceColor.needsUpdate = true;
-      }
-      this.cloudGroup.add(mesh);
     });
   }
 
   private cloudVolumePuffSpecs(volume: CloudVolume, time: Date): CloudPuffSpec[] {
-    const style = CLOUD_VOLUME_STYLES[volume.layer];
+    const style = CLOUD_VOLUME_STYLES[cloudVolumeType(volume)][volume.layer];
     const random = seededRandom(
-      `${volume.lat.toFixed(3)}:${volume.lon.toFixed(3)}:${volume.altitudeMeters.toFixed(0)}:${time.toISOString()}:${volume.layer}`
+      `${volume.lat.toFixed(3)}:${volume.lon.toFixed(3)}:${volume.altitudeMeters.toFixed(0)}:${time.toISOString()}:${volume.layer}:${cloudVolumeType(volume)}`
     );
     const puffCount = clamp(Math.round(1 + volume.cover / 42), 1, 3);
     const specs: CloudPuffSpec[] = [];
@@ -1183,6 +1217,20 @@ class HorizonApp {
       row.textContent = diagnostic.message;
       statusPill.append(row);
     }
+    this.appendCloudVolumeKey();
+  }
+
+  private appendCloudVolumeKey(): void {
+    if (!hasApproximateCloudVolumes(this.clouds)) {
+      return;
+    }
+    const key = document.createElement("div");
+    key.className = "cloud-volume-key";
+    const label = document.createElement("span");
+    label.className = "cloud-volume-key-label";
+    label.textContent = "Volume hue";
+    key.append(label, cloudVolumeKeyItem("modeled", "pale modeled"), cloudVolumeKeyItem("approximate", "magenta approximate"));
+    statusPill.append(key);
   }
 
   private updateConfigurationDiagnostics(): void {
@@ -1233,12 +1281,11 @@ class HorizonApp {
   }
 
   private updateCloudDiagnostics(clouds: CloudSnapshot): void {
-    const fallbackMode = clouds.dataMode === "realtime" ? "real-time data" : "forecast";
     this.updateDiagnostic(
       "cloud-service",
       clouds.warning
         ? {
-            message: `Cloud service issue: ${clouds.warning}; using synthetic ${fallbackMode}.`,
+            message: `Cloud service issue: ${clouds.warning}; using ${cloudFallbackLabel(clouds)}.`,
             severity: "warning"
           }
         : undefined
@@ -1327,6 +1374,29 @@ function setMeter(element: HTMLElement, value: number, hasData: boolean): void {
 
 function formatSignedMeters(value: number): string {
   return `${value >= 0 ? "+" : ""}${value} m`;
+}
+
+function cloudFallbackLabel(clouds: CloudSnapshot): string {
+  return clouds.sourceLabel.startsWith("Synthetic") ? clouds.sourceLabel.toLowerCase() : clouds.sourceLabel;
+}
+
+function cloudVolumeType(volume: CloudVolume): CloudVolumeType {
+  return volume.volumeType ?? "modeled";
+}
+
+function hasApproximateCloudVolumes(clouds: CloudSnapshot | undefined): boolean {
+  return clouds?.map?.volumes.some((volume) => cloudVolumeType(volume) === "approximate") === true;
+}
+
+function cloudVolumeKeyItem(type: CloudVolumeType, label: string): HTMLElement {
+  const item = document.createElement("span");
+  item.className = "cloud-volume-key-item";
+  const swatch = document.createElement("span");
+  swatch.className = `cloud-volume-swatch cloud-volume-swatch-${type}`;
+  const text = document.createElement("span");
+  text.textContent = label;
+  item.append(swatch, text);
+  return item;
 }
 
 function readFiniteParam(params: URLSearchParams, name: string): number | undefined {

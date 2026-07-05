@@ -53,6 +53,7 @@ const HRRR_CLOUD_CACHE_NAME = "hrrr-zarr-cloud-chunks-v1";
 const HRRR_CHUNK_CACHE_TTL_MS = 14 * 24 * HOUR_MS;
 const HRRR_SNAPSHOT_CACHE_TTL_MS = 6 * HOUR_MS;
 const HRRR_MISSING_RUN_TTL_MS = 20 * 60 * 1000;
+const HRRR_MISSING_FORECAST_HOUR_TTL_MS = 20 * 60 * 1000;
 const HRRR_AVAILABILITY_DELAY_MS = 3 * HOUR_MS;
 const HRRR_MAX_FORECAST_HOURS = 48;
 const HRRR_STANDARD_FORECAST_HOURS = 18;
@@ -75,7 +76,7 @@ const BLOSC_DOSHUFFLE = 0x01;
 const BLOSC_DOBITSHUFFLE = 0x02;
 const BLOSC_DONT_SPLIT = 0x10;
 
-const HRRR_EXTENDED_RUN_HOURS = new Set([0, 6, 12, 18, 19]);
+const HRRR_EXTENDED_RUN_HOURS = new Set([0, 6, 12, 18]);
 const HRRR_CLOUD_FIELDS: HrrrCloudField[] = [
   { key: "total", level: "entire_atmosphere", parameter: "TCDC" },
   { key: "low", layer: "low", level: "low_cloud_layer", parameter: "LCDC", altitudeMeters: 1200, thicknessMeters: 850 },
@@ -111,28 +112,39 @@ export async function loadHrrrZarrClouds(
   let lastUnavailable: Error | undefined;
   for (const run of runs) {
     throwIfAborted(signal);
-    const missingKey = hrrrMissingRunCacheKey(run);
-    if (await readPersistentCache<boolean>(missingKey)) {
+    const missingRunKey = hrrrMissingRunCacheKey(run);
+    if (await readPersistentCache<boolean>(missingRunKey)) {
+      lastUnavailable = new Error(`NOAA HRRR Zarr run ${formatHrrrRunLabel(run)} was recently unavailable`);
+      continue;
+    }
+
+    const missingForecastHourKey = hrrrMissingForecastHourCacheKey(run);
+    if (await readPersistentCache<boolean>(missingForecastHourKey)) {
+      lastUnavailable = new Error(`NOAA HRRR Zarr run ${formatHrrrRunLabel(run)} recently did not include that forecast hour`);
       continue;
     }
 
     const cacheKey = hrrrSnapshotCacheKey(run, location);
     const cached = await readPersistentCache<CachedHrrrSnapshot>(cacheKey);
     if (cached) {
-      return hydrateHrrrSnapshot(cached, time, mode);
+      return withHrrrWarning(hydrateHrrrSnapshot(cached, time, mode), lastUnavailable);
     }
 
     try {
       const snapshot = await loadHrrrRunClouds(samples, run, time, signal, mode);
       await writePersistentCache(cacheKey, dehydrateHrrrSnapshot(snapshot), HRRR_SNAPSHOT_CACHE_TTL_MS);
-      return snapshot;
+      return withHrrrWarning(snapshot, lastUnavailable);
     } catch (error) {
       if (isAbortError(error, signal)) {
         throw error;
       }
       if (error instanceof HrrrUnavailableError) {
         lastUnavailable = error;
-        await writePersistentCache(missingKey, true, HRRR_MISSING_RUN_TTL_MS);
+        if (error.cacheScope === "forecastHour") {
+          await writePersistentCache(missingForecastHourKey, true, HRRR_MISSING_FORECAST_HOUR_TTL_MS);
+        } else {
+          await writePersistentCache(missingRunKey, true, HRRR_MISSING_RUN_TTL_MS);
+        }
         continue;
       }
       throw error;
@@ -235,7 +247,10 @@ async function loadHrrrFieldSamples(
       const first = group[0];
       const chunk = await loadHrrrChunk(run, field, first.tileRow, first.tileColumn, signal);
       if (!hrrrChunkContainsForecastHour(chunk, run.forecastHour)) {
-        throw new HrrrUnavailableError(`NOAA HRRR Zarr run ${formatHrrrRunLabel(run)} does not include that forecast hour`);
+        throw new HrrrUnavailableError(
+          `NOAA HRRR Zarr run ${formatHrrrRunLabel(run)} does not include that forecast hour`,
+          "forecastHour"
+        );
       }
       const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
       for (const sample of group) {
@@ -269,7 +284,7 @@ async function loadHrrrChunk(
         return decodeBloscLz4(new Uint8Array(await blob.arrayBuffer()));
       } catch (error) {
         if (error instanceof Error && error.message.includes("404")) {
-          throw new HrrrUnavailableError(`NOAA HRRR Zarr run ${formatHrrrRunLabel(run)} is not available yet`);
+          throw new HrrrUnavailableError(`NOAA HRRR Zarr run ${formatHrrrRunLabel(run)} is not available yet`, "run");
         }
         throw error;
       }
@@ -430,7 +445,21 @@ function hrrrSnapshotCacheKey(run: HrrrRun, location: LocationPoint): string {
 }
 
 function hrrrMissingRunCacheKey(run: HrrrRun): string {
-  return ["cloud", "hrrrZarr", "missing", "v1", hashNumber(run.path).toString(36)].join(":");
+  return ["cloud", "hrrrZarr", "missingRun", "v2", hashNumber(run.path).toString(36)].join(":");
+}
+
+function hrrrMissingForecastHourCacheKey(run: HrrrRun): string {
+  return ["cloud", "hrrrZarr", "missingForecastHour", "v1", hashNumber(run.path).toString(36), `f${run.forecastHour}`].join(":");
+}
+
+function withHrrrWarning(snapshot: CloudSnapshot, warning: Error | undefined): CloudSnapshot {
+  if (!warning) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    warning: snapshot.warning ? `${warning.message}; ${snapshot.warning}` : warning.message
+  };
 }
 
 function decodeBloscLz4(input: Uint8Array): Uint8Array {
@@ -642,4 +671,11 @@ function throwIfAborted(signal?: AbortSignal): void {
   }
 }
 
-class HrrrUnavailableError extends Error {}
+class HrrrUnavailableError extends Error {
+  constructor(
+    message: string,
+    readonly cacheScope: "forecastHour" | "run"
+  ) {
+    super(message);
+  }
+}
