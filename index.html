@@ -119,10 +119,10 @@
           <label>
             Cloud data
             <select id="cloudSource" name="cloudSource">
-              <option value="synthetic">Synthetic forecast</option>
-              <option value="openMeteoGrid">Open-Meteo Forecast Grid</option>
-              <option value="openMeteo">Open-Meteo Point Forecast</option>
-              <option value="openWeather">OpenWeather One Call</option>
+              <option value="openMeteoGrid">Open-Meteo Best Match Grid (fast/ok)</option>
+              <option value="openMeteoEcmwf">Open-Meteo ECMWF IFS Grid (slower/good)</option>
+              <option value="openMeteoBom">BoM ACCESS-G Grid (slow/ok, global)</option>
+              <option value="hrrrZarr">NOAA HRRR Zarr (slow/good, US)</option>
             </select>
           </label>
 
@@ -147,11 +147,6 @@
           <label>
             Mapbox token
             <input id="mapboxToken" name="mapboxToken" autocomplete="off" />
-          </label>
-
-          <label>
-            OpenWeather key
-            <input id="openWeatherKey" name="openWeatherKey" autocomplete="off" />
           </label>
 
           <label>

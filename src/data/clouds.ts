@@ -1,37 +1,7 @@
 import { clamp, hashNumber, offsetLocation, seededRandom } from "../geo";
 import { readPersistentCache, writePersistentCache } from "./cache";
-import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudVolume, LocationPoint, Settings } from "../types";
-
-interface OpenMeteoForecastBody {
-  utc_offset_seconds?: number;
-  hourly?: {
-    time?: string[];
-    cloud_cover?: number[];
-    cloud_cover_low?: number[];
-    cloud_cover_mid?: number[];
-    cloud_cover_high?: number[];
-  };
-}
-
-interface OpenMeteoCurrentBody {
-  utc_offset_seconds?: number;
-  current?: {
-    time?: string;
-    cloud_cover?: number;
-  };
-  hourly?: {
-    time?: string[];
-    cloud_cover?: number[];
-    cloud_cover_low?: number[];
-    cloud_cover_mid?: number[];
-    cloud_cover_high?: number[];
-  };
-}
-
-interface OpenWeatherBody {
-  current?: { dt?: number; clouds?: number };
-  hourly?: Array<{ dt: number; clouds?: number }>;
-}
+import { hrrrZarrCoversLocation, loadHrrrZarrClouds } from "./hrrr";
+import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudSource, CloudVolume, LocationPoint, Settings } from "../types";
 
 interface OpenMeteoGridPointBody {
   latitude?: number;
@@ -59,12 +29,16 @@ interface PressureCloudLevel {
   thicknessMeters: number;
 }
 
-const CLOUD_LOCATION_PRECISION = 4;
-const OPEN_METEO_FORECAST_TTL_MS = 6 * 60 * 60 * 1000;
-const OPEN_METEO_CURRENT_TTL_MS = 5 * 60 * 1000;
+interface OpenMeteoCloudSourceConfig {
+  endpointPath: string;
+  hourlyVariables: string[];
+  models?: string;
+  requestLabel: string;
+  sourceKey: CloudSource;
+  sourceLabel: string;
+}
+
 const OPEN_METEO_GRID_TTL_MS = 90 * 60 * 1000;
-const OPEN_WEATHER_FORECAST_TTL_MS = 2 * 60 * 60 * 1000;
-const OPEN_WEATHER_CURRENT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_GRID_RESOLUTION = 7;
 const CLOUD_GRID_SPACING_METERS = 12000;
 const MIN_GRID_VOLUME_COVER = 12;
@@ -82,6 +56,32 @@ const OPEN_METEO_GRID_HOURLY_VARIABLES = [
   "cloud_cover_high",
   ...PRESSURE_CLOUD_LEVELS.flatMap((level) => [`cloud_cover_${level.hpa}hPa`, `geopotential_height_${level.hpa}hPa`])
 ];
+const OPEN_METEO_LAYER_HOURLY_VARIABLES = ["cloud_cover", "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high"];
+const OPEN_METEO_ECMWF_CONFIG: OpenMeteoCloudSourceConfig = {
+  endpointPath: "/v1/forecast",
+  hourlyVariables: OPEN_METEO_GRID_HOURLY_VARIABLES,
+  models: "ecmwf_ifs",
+  requestLabel: "Open-Meteo ECMWF IFS cloud grid",
+  sourceKey: "openMeteoEcmwf",
+  sourceLabel: "Open-Meteo ECMWF IFS Grid"
+};
+const OPEN_METEO_CLOUD_SOURCE_CONFIGS: Record<Exclude<CloudSource, "hrrrZarr">, OpenMeteoCloudSourceConfig> = {
+  openMeteoGrid: {
+    endpointPath: "/v1/forecast",
+    hourlyVariables: OPEN_METEO_GRID_HOURLY_VARIABLES,
+    requestLabel: "Open-Meteo best-match cloud grid",
+    sourceKey: "openMeteoGrid",
+    sourceLabel: "Open-Meteo Best Match Grid"
+  },
+  openMeteoEcmwf: OPEN_METEO_ECMWF_CONFIG,
+  openMeteoBom: {
+    endpointPath: "/v1/bom",
+    hourlyVariables: OPEN_METEO_LAYER_HOURLY_VARIABLES,
+    requestLabel: "BoM ACCESS-G cloud grid",
+    sourceKey: "openMeteoBom",
+    sourceLabel: "BoM ACCESS-G Grid"
+  }
+};
 
 export async function loadCloudSnapshot(
   location: LocationPoint,
@@ -95,18 +95,27 @@ export async function loadCloudSnapshot(
   }
 
   try {
-    if (settings.cloudSource === "openMeteoGrid") {
-      return await loadOpenMeteoGridClouds(location, time, settings, signal, mode);
+    if (settings.cloudSource === "hrrrZarr") {
+      return await loadHrrrZarrCloudsWithGlobalFallback(location, time, signal, mode, settings);
     }
-    if (settings.cloudSource === "openMeteo") {
-      return mode === "realtime"
-        ? await loadOpenMeteoCurrentClouds(location, time, settings, signal)
-        : await loadOpenMeteoForecastClouds(location, time, settings, signal);
+    if (settings.cloudSource === "openMeteoBom") {
+      return await loadOpenMeteoCloudsWithGlobalFallback(
+        location,
+        time,
+        settings,
+        signal,
+        mode,
+        OPEN_METEO_CLOUD_SOURCE_CONFIGS.openMeteoBom
+      );
     }
-    if (settings.cloudSource === "openWeather") {
-      return await loadOpenWeatherClouds(location, time, settings, signal, mode);
-    }
-    return syntheticClouds(location, time, mode);
+    return await loadOpenMeteoGridClouds(
+      location,
+      time,
+      settings,
+      signal,
+      mode,
+      OPEN_METEO_CLOUD_SOURCE_CONFIGS[settings.cloudSource]
+    );
   } catch (error) {
     if (isAbortError(error, signal)) {
       throw error;
@@ -119,38 +128,81 @@ export async function loadCloudSnapshot(
   }
 }
 
+async function loadHrrrZarrCloudsWithGlobalFallback(
+  location: LocationPoint,
+  time: Date,
+  signal: AbortSignal | undefined,
+  mode: CloudDataMode,
+  settings: Settings
+): Promise<CloudSnapshot> {
+  if (!hrrrZarrCoversLocation(location)) {
+    return loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+  }
+
+  try {
+    return await loadHrrrZarrClouds(location, time, signal, mode);
+  } catch (error) {
+    if (isAbortError(error, signal)) {
+      throw error;
+    }
+    return loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+  }
+}
+
+async function loadOpenMeteoCloudsWithGlobalFallback(
+  location: LocationPoint,
+  time: Date,
+  settings: Settings,
+  signal: AbortSignal | undefined,
+  mode: CloudDataMode,
+  config: OpenMeteoCloudSourceConfig
+): Promise<CloudSnapshot> {
+  try {
+    return await loadOpenMeteoGridClouds(location, time, settings, signal, mode, config);
+  } catch (error) {
+    if (isAbortError(error, signal)) {
+      throw error;
+    }
+    return loadOpenMeteoGridClouds(location, time, settings, signal, mode, OPEN_METEO_ECMWF_CONFIG);
+  }
+}
+
 async function loadOpenMeteoGridClouds(
   location: LocationPoint,
   time: Date,
   settings: Settings,
   signal?: AbortSignal,
-  mode: CloudDataMode = "prediction"
+  mode: CloudDataMode = "prediction",
+  config: OpenMeteoCloudSourceConfig = OPEN_METEO_CLOUD_SOURCE_CONFIGS.openMeteoGrid
 ): Promise<CloudSnapshot> {
   const endpoint = settings.apiKeys.openMeteo
-    ? "https://customer-api.open-meteo.com/v1/forecast"
-    : "https://api.open-meteo.com/v1/forecast";
+    ? `https://customer-api.open-meteo.com${config.endpointPath}`
+    : `https://api.open-meteo.com${config.endpointPath}`;
   const samples = buildCloudGridSamples(location);
   const targetHour = formatOpenMeteoUtcHour(time);
   const params = new URLSearchParams({
     latitude: samples.map((sample) => sample.lat.toFixed(5)).join(","),
     longitude: samples.map((sample) => sample.lon.toFixed(5)).join(","),
-    hourly: OPEN_METEO_GRID_HOURLY_VARIABLES.join(","),
+    hourly: config.hourlyVariables.join(","),
     start_hour: targetHour,
     end_hour: targetHour,
     timezone: "GMT",
     cell_selection: "nearest"
   });
+  if (config.models) {
+    params.set("models", config.models);
+  }
   if (settings.apiKeys.openMeteo) {
     params.set("apikey", settings.apiKeys.openMeteo);
   }
 
   const url = `${endpoint}?${params.toString()}`;
   const body = await loadCachedJson<OpenMeteoGridPointBody | OpenMeteoGridPointBody[]>(
-    openMeteoGridCacheKey(location, targetHour, settings.apiKeys.openMeteo, url),
+    openMeteoGridCacheKey(config.sourceKey, location, targetHour, settings.apiKeys.openMeteo, url),
     OPEN_METEO_GRID_TTL_MS,
     url,
     signal,
-    "Open-Meteo cloud grid"
+    config.requestLabel
   );
   const points = Array.isArray(body) ? body : [body];
   if (!points.length) {
@@ -210,7 +262,7 @@ async function loadOpenMeteoGridClouds(
     low: averagePercent(lows.length ? lows : volumes.filter((volume) => volume.layer === "low").map((volume) => volume.cover)),
     mid: averagePercent(mids.length ? mids : volumes.filter((volume) => volume.layer === "mid").map((volume) => volume.cover)),
     high: averagePercent(highs.length ? highs : volumes.filter((volume) => volume.layer === "high").map((volume) => volume.cover)),
-    sourceLabel: mode === "realtime" ? "Open-Meteo Current Grid" : "Open-Meteo Forecast Grid",
+    sourceLabel: config.sourceLabel,
     map: {
       radiusMeters: CLOUD_GRID_SPACING_METERS * Math.floor(CLOUD_GRID_RESOLUTION / 2),
       resolution: CLOUD_GRID_RESOLUTION,
@@ -237,154 +289,6 @@ function syntheticClouds(location: LocationPoint, time: Date, mode: CloudDataMod
     high,
     sourceLabel: mode === "realtime" ? "Synthetic current" : "Synthetic forecast"
   };
-}
-
-async function loadOpenMeteoForecastClouds(location: LocationPoint, time: Date, settings: Settings, signal?: AbortSignal): Promise<CloudSnapshot> {
-  const endpoint = settings.apiKeys.openMeteo
-    ? "https://customer-api.open-meteo.com/v1/forecast"
-    : "https://api.open-meteo.com/v1/forecast";
-  const params = new URLSearchParams({
-    latitude: location.lat.toFixed(5),
-    longitude: location.lon.toFixed(5),
-    hourly: "cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high",
-    forecast_days: "16",
-    past_days: "1",
-    timezone: "auto"
-  });
-  if (settings.apiKeys.openMeteo) {
-    params.set("apikey", settings.apiKeys.openMeteo);
-  }
-
-  const url = `${endpoint}?${params.toString()}`;
-  const body = await loadCachedJson<OpenMeteoForecastBody>(
-    cloudCacheKey("openMeteoForecast", location, settings.apiKeys.openMeteo),
-    OPEN_METEO_FORECAST_TTL_MS,
-    url,
-    signal,
-    "Open-Meteo forecast"
-  );
-  const hourly = body.hourly;
-  if (!hourly?.time?.length || !hourly.cloud_cover) {
-    throw new Error("Open-Meteo forecast response did not include cloud cover");
-  }
-
-  const offsetMs = (body.utc_offset_seconds ?? 0) * 1000;
-  const bestIndex = closestOpenMeteoHourlyIndex(hourly.time, time.getTime(), offsetMs);
-
-  return {
-    time,
-    dataMode: "prediction",
-    total: normalizePercent(hourly.cloud_cover[bestIndex]),
-    low: normalizePercent(hourly.cloud_cover_low?.[bestIndex]),
-    mid: normalizePercent(hourly.cloud_cover_mid?.[bestIndex]),
-    high: normalizePercent(hourly.cloud_cover_high?.[bestIndex]),
-    sourceLabel: "Open-Meteo Forecast"
-  };
-}
-
-async function loadOpenMeteoCurrentClouds(location: LocationPoint, time: Date, settings: Settings, signal?: AbortSignal): Promise<CloudSnapshot> {
-  const endpoint = settings.apiKeys.openMeteo
-    ? "https://customer-api.open-meteo.com/v1/forecast"
-    : "https://api.open-meteo.com/v1/forecast";
-  const params = new URLSearchParams({
-    latitude: location.lat.toFixed(5),
-    longitude: location.lon.toFixed(5),
-    current: "cloud_cover",
-    hourly: "cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high",
-    forecast_hours: "1",
-    past_hours: "1",
-    timezone: "auto"
-  });
-  if (settings.apiKeys.openMeteo) {
-    params.set("apikey", settings.apiKeys.openMeteo);
-  }
-
-  const url = `${endpoint}?${params.toString()}`;
-  const body = await loadCachedJson<OpenMeteoCurrentBody>(
-    cloudCacheKey("openMeteoCurrent", location, settings.apiKeys.openMeteo),
-    OPEN_METEO_CURRENT_TTL_MS,
-    url,
-    signal,
-    "Open-Meteo current conditions"
-  );
-  const hourly = body.hourly;
-  const offsetMs = (body.utc_offset_seconds ?? 0) * 1000;
-  const target = parseOpenMeteoLocalTime(body.current?.time, offsetMs) ?? time.getTime();
-  const bestIndex = hourly?.time?.length ? closestOpenMeteoHourlyIndex(hourly.time, target, offsetMs) : -1;
-  const total = readPercent(body.current?.cloud_cover ?? hourly?.cloud_cover?.[bestIndex]);
-  const low = readPercent(hourly?.cloud_cover_low?.[bestIndex]);
-  const mid = readPercent(hourly?.cloud_cover_mid?.[bestIndex]);
-  const high = readPercent(hourly?.cloud_cover_high?.[bestIndex]);
-  if (total === undefined) {
-    throw new Error("Open-Meteo current response did not include cloud cover");
-  }
-
-  return {
-    time,
-    dataMode: "realtime",
-    total,
-    low: low ?? Math.round(total * 0.45),
-    mid: mid ?? Math.round(total * 0.35),
-    high: high ?? Math.round(total * 0.3),
-    sourceLabel: "Open-Meteo Current"
-  };
-}
-
-async function loadOpenWeatherClouds(
-  location: LocationPoint,
-  time: Date,
-  settings: Settings,
-  signal?: AbortSignal,
-  mode: CloudDataMode = "prediction"
-): Promise<CloudSnapshot> {
-  const key = settings.apiKeys.openWeather.trim();
-  if (!key) {
-    throw new Error("OpenWeather clouds need an API key in Settings");
-  }
-
-  const params = new URLSearchParams({
-    lat: location.lat.toFixed(5),
-    lon: location.lon.toFixed(5),
-    exclude: "minutely,daily,alerts",
-    units: "metric",
-    appid: key
-  });
-  const url = `https://api.openweathermap.org/data/3.0/onecall?${params.toString()}`;
-  const body = await loadCachedJson<OpenWeatherBody>(
-    cloudCacheKey(`openWeather:${mode}`, location, key),
-    mode === "realtime" ? OPEN_WEATHER_CURRENT_TTL_MS : OPEN_WEATHER_FORECAST_TTL_MS,
-    url,
-    signal,
-    "OpenWeather One Call"
-  );
-  const targetSeconds = Math.round(time.getTime() / 1000);
-  const options = [...(body.current ? [body.current] : []), ...(body.hourly ?? [])].filter((item) => typeof item.dt === "number");
-  if (!options.length) {
-    throw new Error("OpenWeather response did not include cloud cover");
-  }
-  const best =
-    mode === "realtime" && typeof body.current?.clouds === "number"
-      ? body.current
-      : options.reduce((closest, item) =>
-          Math.abs((item.dt ?? 0) - targetSeconds) < Math.abs((closest.dt ?? 0) - targetSeconds) ? item : closest
-        );
-  const total = readPercent(best.clouds);
-  if (total === undefined) {
-    throw new Error("OpenWeather response did not include cloud cover");
-  }
-  return {
-    time,
-    dataMode: mode,
-    total,
-    low: Math.round(total * 0.45),
-    mid: Math.round(total * 0.35),
-    high: Math.round(total * 0.3),
-    sourceLabel: mode === "realtime" ? "OpenWeather Current" : "OpenWeather One Call"
-  };
-}
-
-function normalizePercent(value: unknown): number {
-  return readPercent(value) ?? 0;
 }
 
 function readPercent(value: unknown): number | undefined {
@@ -487,25 +391,15 @@ async function loadCachedJson<T>(cacheKey: string, ttlMs: number, url: string, s
   return body;
 }
 
-function cloudCacheKey(source: string, location: LocationPoint, credential: string): string {
-  return ["cloud", source, credentialFingerprint(credential), cloudLocationBucket(location)].join(":");
-}
-
-function openMeteoGridCacheKey(location: LocationPoint, targetHour: string, credential: string, url: string): string {
+function openMeteoGridCacheKey(sourceKey: string, location: LocationPoint, targetHour: string, credential: string, url: string): string {
   return [
     "cloud",
-    "openMeteoGrid",
+    sourceKey,
     credentialFingerprint(credential),
     targetHour,
     cloudPreciseLocationBucket(location),
     hashNumber(url).toString(36)
   ].join(":");
-}
-
-function cloudLocationBucket(location: LocationPoint): string {
-  const lat = Math.round(location.lat * CLOUD_LOCATION_PRECISION) / CLOUD_LOCATION_PRECISION;
-  const lon = Math.round(location.lon * CLOUD_LOCATION_PRECISION) / CLOUD_LOCATION_PRECISION;
-  return `${lat.toFixed(1)},${lon.toFixed(1)}`;
 }
 
 function cloudPreciseLocationBucket(location: LocationPoint): string {

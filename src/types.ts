@@ -1,5 +1,5 @@
 export type TerrainSource = "synthetic" | "openMeteo" | "mapbox";
-export type CloudSource = "synthetic" | "openMeteo" | "openMeteoGrid" | "openWeather";
+export type CloudSource = "openMeteoGrid" | "openMeteoEcmwf" | "openMeteoBom" | "hrrrZarr";
 export type CloudDataMode = "realtime" | "prediction";
 export type GeocoderSource = "openMeteo" | "nominatim" | "mapbox";
 export type MapSource = "terrainCanvas" | "osmRaster" | "mapboxRaster";
@@ -19,7 +19,6 @@ export interface Settings {
   mapSource: MapSource;
   apiKeys: {
     mapbox: string;
-    openWeather: string;
     openMeteo: string;
   };
   terrainVerticalScale: number;

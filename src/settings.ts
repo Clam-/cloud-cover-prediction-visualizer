@@ -6,7 +6,7 @@ const TERRAIN_VERTICAL_SCALE_MAX = 3;
 const MAX_API_KEY_LENGTH = 2048;
 
 const terrainSources = ["synthetic", "openMeteo", "mapbox"] as const satisfies readonly TerrainSource[];
-const cloudSources = ["synthetic", "openMeteo", "openMeteoGrid", "openWeather"] as const satisfies readonly CloudSource[];
+const cloudSources = ["openMeteoGrid", "openMeteoEcmwf", "openMeteoBom", "hrrrZarr"] as const satisfies readonly CloudSource[];
 const geocoderSources = ["openMeteo", "nominatim", "mapbox"] as const satisfies readonly GeocoderSource[];
 const mapSources = ["terrainCanvas", "osmRaster", "mapboxRaster"] as const satisfies readonly MapSource[];
 
@@ -17,7 +17,6 @@ export const defaultSettings: Settings = {
   mapSource: "terrainCanvas",
   apiKeys: {
     mapbox: "",
-    openWeather: "",
     openMeteo: ""
   },
   terrainVerticalScale: 1.1
@@ -57,7 +56,6 @@ function sanitizeSettings(value: unknown): Settings {
     mapSource: readEnum(input.mapSource, mapSources, defaultSettings.mapSource),
     apiKeys: {
       mapbox: readApiKey(apiKeys.mapbox, defaultSettings.apiKeys.mapbox),
-      openWeather: readApiKey(apiKeys.openWeather, defaultSettings.apiKeys.openWeather),
       openMeteo: readApiKey(apiKeys.openMeteo, defaultSettings.apiKeys.openMeteo)
     },
     terrainVerticalScale: readTerrainVerticalScale(input.terrainVerticalScale, defaultSettings.terrainVerticalScale)

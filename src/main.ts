@@ -2,6 +2,7 @@ import "./styles.css";
 import * as THREE from "three";
 import SunCalc from "suncalc";
 import { loadCloudSnapshot } from "./data/clouds";
+import { hrrrZarrCoversLocation } from "./data/hrrr";
 import { searchLocations } from "./data/geocoders";
 import { loadTerrainGrid, recenterTerrainGrid, terrainHasCoverage } from "./data/terrain";
 import {
@@ -93,7 +94,6 @@ const cloudSource = element<HTMLSelectElement>("cloudSource");
 const geocoderSource = element<HTMLSelectElement>("geocoderSource");
 const mapSource = element<HTMLSelectElement>("mapSource");
 const mapboxToken = element<HTMLInputElement>("mapboxToken");
-const openWeatherKey = element<HTMLInputElement>("openWeatherKey");
 const openMeteoKey = element<HTMLInputElement>("openMeteoKey");
 const terrainScale = element<HTMLInputElement>("terrainScale");
 const MIN_EYE_ELEVATION_METERS = 0;
@@ -1117,12 +1117,17 @@ class HorizonApp {
   }
 
   private cloudRequestKey(mode: CloudDataMode): string {
-    const openWeatherKey = this.settings.apiKeys.openWeather.trim();
     const openMeteoKey = this.settings.apiKeys.openMeteo.trim();
+    const regionalCoverage =
+      this.settings.cloudSource === "hrrrZarr"
+        ? hrrrZarrCoversLocation(this.location)
+          ? "hrrr-native"
+          : "global-fallback"
+        : "standard";
     return [
       this.settings.cloudSource,
       mode,
-      openWeatherKey ? hashNumber(openWeatherKey).toString(36) : "no-open-weather",
+      regionalCoverage,
       openMeteoKey ? hashNumber(openMeteoKey).toString(36) : "open-meteo-public"
     ].join(":");
   }
@@ -1182,7 +1187,6 @@ class HorizonApp {
 
   private updateConfigurationDiagnostics(): void {
     const mapboxKeyMissing = !this.settings.apiKeys.mapbox.trim();
-    const openWeatherKeyMissing = !this.settings.apiKeys.openWeather.trim();
 
     this.updateDiagnostic(
       "config-mapbox-terrain",
@@ -1207,15 +1211,6 @@ class HorizonApp {
       this.settings.mapSource === "mapboxRaster" && mapboxKeyMissing
         ? {
             message: "Mapbox map tiles need a Mapbox token in Settings.",
-            severity: "warning"
-          }
-        : undefined
-    );
-    this.updateDiagnostic(
-      "config-openweather-clouds",
-      this.settings.cloudSource === "openWeather" && openWeatherKeyMissing
-        ? {
-            message: "OpenWeather clouds need an API key in Settings.",
             severity: "warning"
           }
         : undefined
@@ -1266,7 +1261,6 @@ class HorizonApp {
     geocoderSource.value = this.settings.geocoderSource;
     mapSource.value = this.settings.mapSource;
     mapboxToken.value = this.settings.apiKeys.mapbox;
-    openWeatherKey.value = this.settings.apiKeys.openWeather;
     openMeteoKey.value = this.settings.apiKeys.openMeteo;
     terrainScale.value = String(this.settings.terrainVerticalScale);
   }
@@ -1281,7 +1275,6 @@ class HorizonApp {
       terrainVerticalScale: clamp(Number(terrainScale.value) || defaultSettings.terrainVerticalScale, 0.5, 3),
       apiKeys: {
         mapbox: mapboxToken.value.trim(),
-        openWeather: openWeatherKey.value.trim(),
         openMeteo: openMeteoKey.value.trim()
       }
     };
