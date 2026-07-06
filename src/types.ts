@@ -66,7 +66,7 @@ export interface CloudVolume {
   north: number;
   cover: number;
   altitudeMeters: number;
-  altitudeReference: "seaLevel";
+  altitudeReference: "seaLevel" | "ground";
   radiusMeters: number;
   thicknessMeters: number;
   layer: CloudLayer;

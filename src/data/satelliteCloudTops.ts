@@ -1,7 +1,18 @@
 import type { Dataset, File as H5File } from "h5wasm";
-import { clamp, hashNumber, localOffset, offsetLocation, seededRandom } from "../geo";
+import {
+  buildGridSamples,
+  clamp,
+  degreesToRadians,
+  hashNumber,
+  localOffset,
+  normalizeLongitude,
+  offsetLocation,
+  radiansToDegrees,
+  seededRandom,
+  type GridSample
+} from "../geo";
 import type { CloudLayer, CloudSnapshot, CloudVolume, LocationPoint } from "../types";
-import { fetchCachedBlob, readPersistentCache, writePersistentCache } from "./cache";
+import { errorMessage, fetchCachedBlob, isAbortError, loadCachedText, throwIfAborted } from "./cache";
 
 type SatelliteCloudTopSource = GoesCloudTopSource | HimawariCloudTopSource;
 
@@ -18,14 +29,9 @@ interface HimawariCloudTopSource {
   longitude: number;
 }
 
-interface CloudTopSample extends LocationPoint {
-  east: number;
-  north: number;
-}
-
 interface GoesGrid {
-  data: Uint16Array;
-  dqf?: Uint8Array;
+  data: Uint16Array | Int16Array;
+  dqf?: Uint8Array | Int8Array;
   fillValue: number;
   heightOffset: number;
   heightScale: number;
@@ -52,21 +58,28 @@ interface SatelliteOverlay {
   warning?: string;
 }
 
+export interface RealtimeSatelliteCloudTops {
+  apply(snapshot: CloudSnapshot): Promise<CloudSnapshot>;
+}
+
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const SATELLITE_GRID_RESOLUTION = 7;
 const SATELLITE_GRID_SPACING_METERS = 12000;
 const SATELLITE_MIN_COVER = 12;
+// The ACHA product carries no cloud-fraction information, so satellite-top
+// volumes use a fixed nominal cover rather than a value derived from DQF.
+const SATELLITE_TOP_COVER = 82;
 const GOES_PRODUCT = "ABI-L2-ACHAF";
 const GOES_AVAILABILITY_DELAY_MS = 18 * 60 * 1000;
 const GOES_LOOKBACK_HOURS = 8;
 const GOES_LISTING_TTL_MS = 5 * 60 * 1000;
 const GOES_FILE_TTL_MS = 45 * 60 * 1000;
 const GOES_CLOUD_CACHE_NAME = "goes-cloud-top-height-v1";
-const HIMAWARI_MIN_LAT = -62;
-const HIMAWARI_MAX_LAT = 62;
-const GOES_MIN_LAT = -62;
-const GOES_MAX_LAT = 62;
+// Retrievals degrade sharply approaching the ~81.3 degree geostationary earth
+// limb, so stop well short of it and of the poles.
+const MAX_SATELLITE_CENTRAL_ANGLE_DEGREES = 80;
+const MAX_SATELLITE_LATITUDE_DEGREES = 62;
 
 const GOES_SOURCES: GoesCloudTopSource[] = [
   { kind: "goes", bucket: "noaa-goes19", label: "GOES-19 CTH", longitude: -75 },
@@ -77,39 +90,70 @@ const HIMAWARI_SOURCE: HimawariCloudTopSource = {
   label: "Himawari CTH proxy",
   longitude: 140.7
 };
+const SATELLITE_SOURCES: SatelliteCloudTopSource[] = [...GOES_SOURCES, HIMAWARI_SOURCE];
 
 let h5wasmPromise: Promise<(typeof import("h5wasm"))["default"]> | undefined;
+let decodedGoesGrid: { cacheKey: string; grid: GoesGrid } | undefined;
 
-export async function withRealtimeSatelliteCloudTops(
-  snapshot: CloudSnapshot,
+export function beginRealtimeSatelliteCloudTops(
   location: LocationPoint,
   time: Date,
   signal?: AbortSignal
-): Promise<CloudSnapshot> {
-  if (snapshot.dataMode !== "realtime") {
-    return snapshot;
-  }
-
+): RealtimeSatelliteCloudTops | undefined {
   const source = satelliteCloudTopSource(location);
   if (!source) {
-    return snapshot;
+    return undefined;
   }
 
-  try {
-    const overlay =
-      source.kind === "goes"
-        ? await loadGoesCloudTopOverlay(source, location, time, signal)
-        : buildHimawariCloudTopOverlay(source, snapshot, location, time);
-    return overlay ? snapshotWithSatelliteOverlay(snapshot, overlay) : snapshot;
-  } catch (error) {
-    if (isAbortError(error, signal)) {
-      throw error;
-    }
-    return {
-      ...snapshot,
-      satelliteTopWarning: `${source.label} overlay unavailable: ${errorMessage(error, "satellite cloud-top load failed")}`
-    };
+  if (source.kind === "goes") {
+    // Start the GOES download immediately so it overlaps the base cloud load;
+    // the settled wrapper keeps an early failure from becoming an unhandled
+    // rejection while the base load is still in flight.
+    const pending: Promise<{ value: SatelliteOverlay | undefined } | { error: unknown }> = loadGoesCloudTopOverlay(
+      source,
+      location,
+      time,
+      signal
+    ).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error })
+    );
+    return satelliteCloudTopApplier(source, signal, async () => {
+      const settled = await pending;
+      if ("error" in settled) {
+        throw settled.error;
+      }
+      return settled.value;
+    });
   }
+
+  return satelliteCloudTopApplier(source, signal, async (snapshot) => buildHimawariCloudTopOverlay(source, snapshot, location, time));
+}
+
+function satelliteCloudTopApplier(
+  source: SatelliteCloudTopSource,
+  signal: AbortSignal | undefined,
+  loadOverlay: (snapshot: CloudSnapshot) => Promise<SatelliteOverlay | undefined>
+): RealtimeSatelliteCloudTops {
+  return {
+    async apply(snapshot: CloudSnapshot): Promise<CloudSnapshot> {
+      if (snapshot.dataMode !== "realtime") {
+        return snapshot;
+      }
+      try {
+        const overlay = await loadOverlay(snapshot);
+        return overlay ? snapshotWithSatelliteOverlay(snapshot, overlay) : snapshot;
+      } catch (error) {
+        if (isAbortError(error, signal)) {
+          throw error;
+        }
+        return {
+          ...snapshot,
+          satelliteTopWarning: `${source.label} overlay unavailable: ${errorMessage(error, "satellite cloud-top load failed")}`
+        };
+      }
+    }
+  };
 }
 
 async function loadH5Wasm(): Promise<(typeof import("h5wasm"))["default"]> {
@@ -118,22 +162,22 @@ async function loadH5Wasm(): Promise<(typeof import("h5wasm"))["default"]> {
 }
 
 function satelliteCloudTopSource(location: LocationPoint): SatelliteCloudTopSource | undefined {
-  const goesSources = GOES_SOURCES.filter((source) => goesSourceCoversLocation(source, location));
-  if (goesSources.length) {
-    return goesSources.sort((a, b) => longitudeDistance(location.lon, a.longitude) - longitudeDistance(location.lon, b.longitude))[0];
+  if (Math.abs(location.lat) > MAX_SATELLITE_LATITUDE_DEGREES) {
+    return undefined;
   }
-  return himawariCoversLocation(location) ? HIMAWARI_SOURCE : undefined;
+  const covering = SATELLITE_SOURCES.map((source) => ({
+    source,
+    centralAngle: satelliteCentralAngleDegrees(location, source.longitude)
+  }))
+    .filter((candidate) => candidate.centralAngle <= MAX_SATELLITE_CENTRAL_ANGLE_DEGREES)
+    .sort((a, b) => a.centralAngle - b.centralAngle);
+  return covering[0]?.source;
 }
 
-function goesSourceCoversLocation(source: GoesCloudTopSource, location: LocationPoint): boolean {
-  if (location.lat < GOES_MIN_LAT || location.lat > GOES_MAX_LAT) {
-    return false;
-  }
-  return longitudeDistance(location.lon, source.longitude) <= 82;
-}
-
-function himawariCoversLocation(location: LocationPoint): boolean {
-  return location.lat >= HIMAWARI_MIN_LAT && location.lat <= HIMAWARI_MAX_LAT && longitudeDistance(location.lon, HIMAWARI_SOURCE.longitude) <= 82;
+function satelliteCentralAngleDegrees(location: LocationPoint, satelliteLongitude: number): number {
+  const latitude = degreesToRadians(location.lat);
+  const lonDistance = degreesToRadians(longitudeDistanceDegrees(location.lon, satelliteLongitude));
+  return radiansToDegrees(Math.acos(clamp(Math.cos(latitude) * Math.cos(lonDistance), -1, 1)));
 }
 
 async function loadGoesCloudTopOverlay(
@@ -144,7 +188,7 @@ async function loadGoesCloudTopOverlay(
 ): Promise<SatelliteOverlay | undefined> {
   const key = await latestGoesCloudTopKey(source, time, signal);
   const grid = await loadGoesCloudTopGrid(source, key, signal);
-  const samples = buildSatelliteSamples(location);
+  const samples = buildGridSamples(location, SATELLITE_GRID_RESOLUTION, SATELLITE_GRID_SPACING_METERS);
   const volumes = samples.flatMap((sample) => goesSampleToVolume(grid, sample));
   if (!volumes.length) {
     return undefined;
@@ -162,7 +206,7 @@ async function latestGoesCloudTopKey(source: GoesCloudTopSource, time: Date, sig
     const { year, dayOfYear, hour } = utcPathParts(candidate);
     const prefix = `${GOES_PRODUCT}/${year}/${dayOfYear}/${hour}/`;
     const url = `https://${source.bucket}.s3.amazonaws.com/?list-type=2&prefix=${prefix}&max-keys=1000`;
-    const xml = await loadCachedText(goesListingCacheKey(source, prefix), GOES_LISTING_TTL_MS, url, signal, source.label);
+    const xml = await loadCachedText(goesListingCacheKey(source, prefix), GOES_LISTING_TTL_MS, url, signal, `${source.label} listing`);
     const keys = parseS3Keys(xml).filter((key) => key.endsWith(".nc"));
     if (keys.length) {
       return keys[keys.length - 1];
@@ -172,20 +216,20 @@ async function latestGoesCloudTopKey(source: GoesCloudTopSource, time: Date, sig
 }
 
 async function loadGoesCloudTopGrid(source: GoesCloudTopSource, key: string, signal: AbortSignal | undefined): Promise<GoesGrid> {
-  if (signal?.aborted) {
-    throw new DOMException("Aborted", "AbortError");
+  throwIfAborted(signal);
+  const cacheKey = `${source.bucket}:${key}`;
+  if (decodedGoesGrid?.cacheKey === cacheKey) {
+    return decodedGoesGrid.grid;
   }
 
   const url = `https://${source.bucket}.s3.amazonaws.com/${key}`;
   const blob = await fetchCachedBlob(GOES_CLOUD_CACHE_NAME, url, GOES_FILE_TTL_MS, signal);
   const bytes = new Uint8Array(await blob.arrayBuffer());
-  if (signal?.aborted) {
-    throw new DOMException("Aborted", "AbortError");
-  }
+  throwIfAborted(signal);
 
   const h5wasm = await loadH5Wasm();
   const { FS } = await h5wasm.ready;
-  const fileName = `goes-cloud-top-${hashNumber(`${source.bucket}:${key}`).toString(36)}.nc`;
+  const fileName = `goes-cloud-top-${hashNumber(cacheKey).toString(36)}.nc`;
   try {
     try {
       FS.unlink(fileName);
@@ -195,7 +239,9 @@ async function loadGoesCloudTopGrid(source: GoesCloudTopSource, key: string, sig
     FS.writeFile(fileName, bytes);
     const file = new h5wasm.File(fileName, "r");
     try {
-      return readGoesCloudTopGrid(file);
+      const grid = readGoesCloudTopGrid(file);
+      decodedGoesGrid = { cacheKey, grid };
+      return grid;
     } finally {
       file.close();
     }
@@ -218,9 +264,14 @@ function readGoesCloudTopGrid(file: H5File): GoesGrid {
     throw new Error("GOES CTH grid did not include a 2D height field");
   }
 
-  const data = typedArrayValue<Uint16Array>(height, Uint16Array, "HT");
+  // GOES-R L2 files pack variables as signed shorts flagged `_Unsigned = "true"`;
+  // h5wasm surfaces them as Int16Array with attribute values in the signed domain,
+  // so both the data and its fill/valid-range attributes need reinterpreting.
+  const unsigned = isUnsignedPacked(height);
+  const toRawDomain = unsigned ? unsignedShortDomain : (value: number) => value;
+  const data = packedShortValues(height, unsigned, "HT");
   const dqfDataset = file.get("DQF");
-  const dqf = isDataset(dqfDataset) ? typedArrayValue<Uint8Array>(dqfDataset, Uint8Array, "DQF") : undefined;
+  const dqf = isDataset(dqfDataset) ? packedByteValues(dqfDataset, "DQF") : undefined;
   const validRange = numberArrayAttr(height, "valid_range");
   const semiMajorAxis = numberAttr(projection, "semi_major_axis");
   const semiMinorAxis = numberAttr(projection, "semi_minor_axis");
@@ -230,18 +281,18 @@ function readGoesCloudTopGrid(file: H5File): GoesGrid {
   return {
     data,
     dqf,
-    fillValue: numberAttr(height, "_FillValue"),
+    fillValue: toRawDomain(numberAttr(height, "_FillValue")),
     heightOffset: numberAttr(height, "add_offset"),
     heightScale: numberAttr(height, "scale_factor"),
     projection: {
       heightFromEarthCenter: perspectivePointHeight + semiMajorAxis,
       semiMajorAxis,
       semiMinorAxis,
-      subpointLongitudeRadians: (subpointLongitude * Math.PI) / 180
+      subpointLongitudeRadians: degreesToRadians(subpointLongitude)
     },
     rows: shape[0],
-    validMax: validRange[1] ?? Number.POSITIVE_INFINITY,
-    validMin: validRange[0] ?? Number.NEGATIVE_INFINITY,
+    validMax: validRange[1] !== undefined ? toRawDomain(validRange[1]) : Number.POSITIVE_INFINITY,
+    validMin: validRange[0] !== undefined ? toRawDomain(validRange[0]) : Number.NEGATIVE_INFINITY,
     xOffset: numberAttr(x, "add_offset"),
     xScale: numberAttr(x, "scale_factor"),
     yOffset: numberAttr(y, "add_offset"),
@@ -249,7 +300,7 @@ function readGoesCloudTopGrid(file: H5File): GoesGrid {
   };
 }
 
-function goesSampleToVolume(grid: GoesGrid, sample: CloudTopSample): CloudVolume[] {
+function goesSampleToVolume(grid: GoesGrid, sample: GridSample): CloudVolume[] {
   const projected = projectGoesFixedGrid(sample, grid.projection);
   if (!projected) {
     return [];
@@ -280,14 +331,13 @@ function goesSampleToVolume(grid: GoesGrid, sample: CloudTopSample): CloudVolume
   }
 
   const layer = cloudLayerFromAltitude(altitudeMeters);
-  const cover = clamp(82 - (quality ?? 0) * 12, 46, 88);
   return [
     {
       lat: sample.lat,
       lon: sample.lon,
       east: sample.east,
       north: sample.north,
-      cover,
+      cover: SATELLITE_TOP_COVER,
       altitudeMeters,
       altitudeReference: "seaLevel",
       radiusMeters: SATELLITE_GRID_SPACING_METERS * 0.72,
@@ -299,8 +349,8 @@ function goesSampleToVolume(grid: GoesGrid, sample: CloudTopSample): CloudVolume
 }
 
 function projectGoesFixedGrid(location: Pick<LocationPoint, "lat" | "lon">, projection: GoesProjection): { x: number; y: number } | undefined {
-  const latitude = (location.lat * Math.PI) / 180;
-  const longitude = (location.lon * Math.PI) / 180;
+  const latitude = degreesToRadians(location.lat);
+  const longitude = degreesToRadians(location.lon);
   const longitudeOffset = longitude - projection.subpointLongitudeRadians;
   const equatorialRadius = projection.semiMajorAxis;
   const polarRadius = projection.semiMinorAxis;
@@ -310,6 +360,14 @@ function projectGoesFixedGrid(location: Pick<LocationPoint, "lat" | "lon">, proj
   const sx = projection.heightFromEarthCenter - earthRadius * Math.cos(geocentricLatitude) * Math.cos(longitudeOffset);
   const sy = -earthRadius * Math.cos(geocentricLatitude) * Math.sin(longitudeOffset);
   const sz = earthRadius * Math.sin(geocentricLatitude);
+
+  // GOES-R PUG visibility check: points beyond the earth limb would otherwise
+  // project onto valid-looking scan angles that belong to a different location.
+  const h = projection.heightFromEarthCenter;
+  if (h * (h - sx) < sy ** 2 + (equatorialRadius ** 2 / polarRadius ** 2) * sz ** 2) {
+    return undefined;
+  }
+
   const range = Math.sqrt(sx ** 2 + sy ** 2 + sz ** 2);
   const x = Math.asin(-sy / range);
   const y = Math.atan(sz / sx);
@@ -341,7 +399,6 @@ function cloudVolumeToSatelliteTop(volume: CloudVolume): CloudVolume {
   return {
     ...volume,
     altitudeMeters,
-    cover: clamp(volume.cover + 8, 36, 90),
     layer,
     radiusMeters: volume.radiusMeters * 0.78,
     thicknessMeters: satelliteTopThickness(layer, altitudeMeters),
@@ -371,9 +428,11 @@ function buildFallbackHimawariTops(snapshot: CloudSnapshot, location: LocationPo
       volumes.push({
         ...sample,
         ...localOffset(location, sample),
-        cover: clamp(layer.cover + 6, 34, 88),
+        cover: layer.cover,
         altitudeMeters: layer.altitudeMeters,
-        altitudeReference: "seaLevel",
+        // These are typical layer heights, not observations, so anchor them to
+        // the ground: fixed sea-level altitudes would sit below elevated terrain.
+        altitudeReference: "ground",
         radiusMeters: SATELLITE_GRID_SPACING_METERS * (0.58 + random() * 0.32),
         thicknessMeters: satelliteTopThickness(layer.layer, layer.altitudeMeters),
         layer: layer.layer,
@@ -405,46 +464,6 @@ function snapshotWithSatelliteOverlay(snapshot: CloudSnapshot, overlay: Satellit
   };
 }
 
-function buildSatelliteSamples(location: LocationPoint): CloudTopSample[] {
-  const samples: CloudTopSample[] = [];
-  const half = Math.floor(SATELLITE_GRID_RESOLUTION / 2);
-  for (let row = 0; row < SATELLITE_GRID_RESOLUTION; row += 1) {
-    for (let column = 0; column < SATELLITE_GRID_RESOLUTION; column += 1) {
-      const east = (column - half) * SATELLITE_GRID_SPACING_METERS;
-      const north = (half - row) * SATELLITE_GRID_SPACING_METERS;
-      samples.push({
-        ...offsetLocation(location, east, north),
-        east,
-        north
-      });
-    }
-  }
-  return samples;
-}
-
-async function loadCachedText(
-  cacheKey: string,
-  ttlMs: number,
-  url: string,
-  signal: AbortSignal | undefined,
-  label: string
-): Promise<string> {
-  if (signal?.aborted) {
-    throw new DOMException("Aborted", "AbortError");
-  }
-  const cached = await readPersistentCache<string>(cacheKey);
-  if (cached) {
-    return cached;
-  }
-  const response = await fetch(url, { signal });
-  if (!response.ok) {
-    throw new Error(`${label} listing returned ${response.status}`);
-  }
-  const body = await response.text();
-  await writePersistentCache(cacheKey, body, ttlMs);
-  return body;
-}
-
 function parseS3Keys(xml: string): string[] {
   const document = new DOMParser().parseFromString(xml, "application/xml");
   return Array.from(document.getElementsByTagName("Key"))
@@ -474,16 +493,33 @@ function isDataset(item: unknown): item is Dataset {
   return typeof item === "object" && item !== null && "attrs" in item && "shape" in item && "value" in item;
 }
 
-function typedArrayValue<T extends Uint8Array | Uint16Array>(
-  dataset: Dataset,
-  constructor: { new (buffer: ArrayBufferLike): T },
-  label: string
-): T {
+function packedShortValues(dataset: Dataset, unsigned: boolean, label: string): Uint16Array | Int16Array {
   const value = dataset.value;
-  if (!(value instanceof constructor)) {
-    throw new Error(`GOES CTH ${label} field had an unexpected data type`);
+  if (value instanceof Uint16Array) {
+    return value;
   }
-  return value;
+  if (value instanceof Int16Array) {
+    return unsigned ? new Uint16Array(value.buffer, value.byteOffset, value.length) : value;
+  }
+  throw new Error(`GOES CTH ${label} field had an unexpected data type`);
+}
+
+function packedByteValues(dataset: Dataset, label: string): Uint8Array | Int8Array {
+  const value = dataset.value;
+  if (value instanceof Uint8Array || value instanceof Int8Array) {
+    return value;
+  }
+  throw new Error(`GOES CTH ${label} field had an unexpected data type`);
+}
+
+function isUnsignedPacked(dataset: Dataset): boolean {
+  const raw = dataset.attrs["_Unsigned"]?.value;
+  const text = typeof raw === "string" ? raw : Array.isArray(raw) ? raw[0] : undefined;
+  return typeof text === "string" && text.toLowerCase() === "true";
+}
+
+function unsignedShortDomain(value: number): number {
+  return value < 0 ? value + 0x10000 : value;
 }
 
 function numberAttr(dataset: Dataset, name: string): number {
@@ -530,15 +566,6 @@ function goesListingCacheKey(source: GoesCloudTopSource, prefix: string): string
   return ["cloud", "goesCth", source.bucket, prefix].join(":");
 }
 
-function longitudeDistance(a: number, b: number): number {
-  const diff = Math.abs((((a - b + 180) % 360) + 360) % 360 - 180);
-  return diff;
-}
-
-function isAbortError(error: unknown, signal?: AbortSignal): boolean {
-  return signal?.aborted === true || (error instanceof DOMException && error.name === "AbortError");
-}
-
-function errorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
+function longitudeDistanceDegrees(a: number, b: number): number {
+  return Math.abs(normalizeLongitude(a - b));
 }

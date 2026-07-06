@@ -7,7 +7,9 @@ export interface TerrainSurfacePoint {
   north: number;
 }
 
-const PEAKFINDER_CURVATURE_DROP_COEFFICIENT = 6.54443e-8;
+const EARTH_RADIUS_METERS = 6371008.8;
+// k = 0.166 makes (1 - k) / (2R) match the ~6.5444e-8 per-meter² drop PeakFinder uses.
+const REFRACTION_COEFFICIENT = 0.166;
 const NEAR_VIEWPOINT_DROP_METERS = 20;
 const NEAR_VIEWPOINT_DROP_RANGE_METERS = 1000;
 
@@ -17,7 +19,7 @@ export function smoothstep(value: number): number {
 }
 
 export function terrainCurvatureDrop(distanceMeters: number): number {
-  return distanceMeters * distanceMeters * PEAKFINDER_CURVATURE_DROP_COEFFICIENT;
+  return ((distanceMeters * distanceMeters) / (2 * EARTH_RADIUS_METERS)) * (1 - REFRACTION_COEFFICIENT);
 }
 
 export function nearViewpointTerrainDrop(distanceMeters: number): number {

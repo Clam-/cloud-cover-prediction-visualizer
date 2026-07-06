@@ -173,46 +173,57 @@ export class MiniMap {
 
   private drawTerrainOverlay(width: number, height: number): void {
     const centerLocation = this.mapCenter();
-    if (!this.terrain || !centerLocation) {
+    const metersPerPixel = this.terrainMetersPerPixel(width, height);
+    if (!this.terrain || !centerLocation || metersPerPixel === undefined) {
       return;
     }
 
     const terrain = this.terrain;
-    const visibleExtent = terrain.extentMeters / this.currentTerrainZoom();
     const centerOffset = localOffset(terrain.center, centerLocation);
     const min = terrain.minElevation;
     const max = Math.max(min + 1, terrain.maxElevation);
-    const cellW = (width / (terrain.resolution - 1)) * this.currentTerrainZoom();
-    const cellH = (height / (terrain.resolution - 1)) * this.currentTerrainZoom();
+    const gridSpacing = (terrain.extentMeters * 2) / Math.max(1, terrain.resolution - 1);
+    const cellSize = gridSpacing / metersPerPixel;
+    const maxEast = (width / 2) * metersPerPixel + gridSpacing;
+    const maxNorth = (height / 2) * metersPerPixel + gridSpacing;
 
     for (let z = 0; z < terrain.resolution; z += 1) {
       for (let x = 0; x < terrain.resolution; x += 1) {
         const sample = terrain.samples[z][x];
         const east = sample.east - centerOffset.east;
         const north = sample.north - centerOffset.north;
-        if (Math.abs(east) > visibleExtent || Math.abs(north) > visibleExtent) {
+        if (Math.abs(east) > maxEast || Math.abs(north) > maxNorth) {
           continue;
         }
-        const px = ((east + visibleExtent) / (visibleExtent * 2)) * width;
-        const py = height - ((north + visibleExtent) / (visibleExtent * 2)) * height;
+        const px = width / 2 + east / metersPerPixel;
+        const py = height / 2 - north / metersPerPixel;
         const t = clamp((sample.elevation - min) / (max - min), 0, 1);
         const r = Math.round(26 + t * 172);
         const g = Math.round(78 + t * 118);
         const b = Math.round(70 - t * 28);
         this.context.fillStyle = `rgba(${r}, ${g}, ${b}, 0.42)`;
-        this.context.fillRect(px - cellW / 2, py - cellH / 2, cellW + 1, cellH + 1);
+        this.context.fillRect(px - cellSize / 2, py - cellSize / 2, cellSize + 1, cellSize + 1);
       }
     }
+  }
+
+  // One isotropic scale for both axes: fitting ±visibleExtent to each canvas
+  // axis independently would squash terrain and skew bearings off the yaw line.
+  private terrainMetersPerPixel(width: number, height: number): number | undefined {
+    if (!this.terrain) {
+      return undefined;
+    }
+    const visibleExtent = this.terrain.extentMeters / this.currentTerrainZoom();
+    return (visibleExtent * 2) / Math.max(1, Math.min(width, height));
   }
 
   private drawPov(width: number, height: number): void {
     if (!this.location) {
       return;
     }
-    const point = this.pointForLocation(this.location, width, height);
-    if (!point) {
-      return;
-    }
+    // Without terrain the viewport center always equals the location, so the
+    // canvas center is the correct fallback for the marker.
+    const point = this.pointForLocation(this.location, width, height) ?? { x: width / 2, y: height / 2 };
     const lookX = Math.sin(this.yaw);
     const lookY = -Math.cos(this.yaw);
 
@@ -249,18 +260,23 @@ export class MiniMap {
       };
     }
 
-    if (!this.terrain) {
+    const metersPerPixel = this.terrainMetersPerPixel(width, height);
+    if (metersPerPixel === undefined) {
       return undefined;
     }
-    const visibleExtent = this.terrain.extentMeters / this.currentTerrainZoom();
     const offset = localOffset(centerLocation, location);
     return {
-      x: ((offset.east + visibleExtent) / (visibleExtent * 2)) * width,
-      y: height - ((offset.north + visibleExtent) / (visibleExtent * 2)) * height
+      x: width / 2 + offset.east / metersPerPixel,
+      y: height / 2 - offset.north / metersPerPixel
     };
   }
 
   private pickZoom(width: number, centerLocation = this.mapCenter()): number {
+    // Keep the tile zoom frozen while a drag is active so pan deltas (converted
+    // at startZoom) stay consistent with the rendered scale.
+    if (this.pointerDown?.moved) {
+      return this.pointerDown.startZoom;
+    }
     if (!this.terrain || !centerLocation) {
       return clamp(10 + this.zoomOffset, 4, 18);
     }
@@ -400,13 +416,11 @@ export class MiniMap {
       return worldPixelToLonLat(center.x - dx, center.y - dy, pointerDown.startZoom, tileSize);
     }
 
-    if (!this.terrain) {
+    const metersPerPixel = this.terrainMetersPerPixel(rect.width, rect.height);
+    if (metersPerPixel === undefined) {
       return pointerDown.startCenter;
     }
-    const visibleExtent = this.terrain.extentMeters / this.currentTerrainZoom();
-    const east = (-dx / Math.max(rect.width, 1)) * visibleExtent * 2;
-    const north = (dy / Math.max(rect.height, 1)) * visibleExtent * 2;
-    return offsetLocation(pointerDown.startCenter, east, north);
+    return offsetLocation(pointerDown.startCenter, -dx * metersPerPixel, dy * metersPerPixel);
   }
 
   private locationForPointer(event: PointerEvent): LocationPoint | undefined {
@@ -426,13 +440,11 @@ export class MiniMap {
       return worldPixelToLonLat(center.x - rect.width / 2 + x, center.y - rect.height / 2 + y, zoom, tileSize);
     }
 
-    if (!this.terrain) {
+    const metersPerPixel = this.terrainMetersPerPixel(rect.width, rect.height);
+    if (metersPerPixel === undefined) {
       return undefined;
     }
-    const visibleExtent = this.terrain.extentMeters / this.currentTerrainZoom();
-    const east = (x / Math.max(rect.width, 1) - 0.5) * visibleExtent * 2;
-    const north = (0.5 - y / Math.max(rect.height, 1)) * visibleExtent * 2;
-    return offsetLocation(centerLocation, east, north);
+    return offsetLocation(centerLocation, (x - rect.width / 2) * metersPerPixel, (rect.height / 2 - y) * metersPerPixel);
   }
 }
 

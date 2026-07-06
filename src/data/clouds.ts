@@ -1,7 +1,7 @@
-import { clamp, hashNumber, offsetLocation, seededRandom } from "../geo";
-import { readPersistentCache, writePersistentCache } from "./cache";
+import { buildGridSamples, clamp, hashNumber, seededRandom, type GridSample } from "../geo";
+import { errorMessage, isAbortError, loadCachedJson, throwIfAborted } from "./cache";
 import { hrrrZarrCoversLocation, loadHrrrZarrClouds } from "./hrrr";
-import { withRealtimeSatelliteCloudTops } from "./satelliteCloudTops";
+import { beginRealtimeSatelliteCloudTops } from "./satelliteCloudTops";
 import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudSource, CloudVolume, LocationPoint, Settings } from "../types";
 
 interface OpenMeteoGridPointBody {
@@ -14,13 +14,6 @@ interface OpenMeteoGridPointBody {
 interface OpenMeteoGridHourly {
   time?: string[];
   [key: string]: number[] | string[] | undefined;
-}
-
-interface CloudGridSample extends LocationPoint {
-  column: number;
-  east: number;
-  north: number;
-  row: number;
 }
 
 interface PressureCloudLevel {
@@ -39,7 +32,7 @@ interface ApproximateCloudLayer {
 interface LayerCloudSample {
   cover: number;
   layer: CloudLayer;
-  sample: CloudGridSample;
+  sample: GridSample;
 }
 
 interface OpenMeteoCloudSourceConfig {
@@ -108,9 +101,11 @@ export async function loadCloudSnapshot(
   signal?: AbortSignal,
   mode: CloudDataMode = "prediction"
 ): Promise<CloudSnapshot> {
-  if (signal?.aborted) {
-    throw new DOMException("Aborted", "AbortError");
-  }
+  throwIfAborted(signal);
+
+  // Kick off the satellite overlay load now so it runs concurrently with the
+  // base cloud load; it is merged into the snapshot once both are available.
+  const satellite = mode === "realtime" ? beginRealtimeSatelliteCloudTops(location, time, signal) : undefined;
 
   try {
     let snapshot: CloudSnapshot;
@@ -135,7 +130,7 @@ export async function loadCloudSnapshot(
         OPEN_METEO_CLOUD_SOURCE_CONFIGS[settings.cloudSource]
       );
     }
-    return await withRealtimeSatelliteCloudTops(snapshot, location, time, signal);
+    return satellite ? await satellite.apply(snapshot) : snapshot;
   } catch (error) {
     if (isAbortError(error, signal)) {
       throw error;
@@ -211,7 +206,7 @@ async function loadOpenMeteoGridClouds(
   const endpoint = settings.apiKeys.openMeteo
     ? `https://customer-api.open-meteo.com${config.endpointPath}`
     : `https://api.open-meteo.com${config.endpointPath}`;
-  const samples = buildCloudGridSamples(location);
+  const samples = buildGridSamples(location, CLOUD_GRID_RESOLUTION, CLOUD_GRID_SPACING_METERS);
   const targetHour = formatOpenMeteoUtcHour(time);
   const params = new URLSearchParams({
     latitude: samples.map((sample) => sample.lat.toFixed(5)).join(","),
@@ -367,7 +362,7 @@ function averagePercent(values: number[]): number {
 
 function pushLayerSample(
   layerSamples: LayerCloudSample[],
-  sample: CloudGridSample,
+  sample: GridSample,
   layer: CloudLayer,
   cover: number | undefined
 ): void {
@@ -399,7 +394,7 @@ function buildApproximateLayerVolumes(layerSamples: LayerCloudSample[], modeledL
     });
 }
 
-function layerSampleKey(sample: CloudGridSample, layer: CloudLayer): string {
+function layerSampleKey(sample: GridSample, layer: CloudLayer): string {
   return `${sample.row}:${sample.column}:${layer}`;
 }
 
@@ -432,25 +427,6 @@ function withCloudWarning(snapshot: CloudSnapshot, warning: string): CloudSnapsh
     ...snapshot,
     warning: snapshot.warning ? `${warning}; ${snapshot.warning}` : warning
   };
-}
-
-function buildCloudGridSamples(location: LocationPoint): CloudGridSample[] {
-  const samples: CloudGridSample[] = [];
-  const half = Math.floor(CLOUD_GRID_RESOLUTION / 2);
-  for (let row = 0; row < CLOUD_GRID_RESOLUTION; row += 1) {
-    for (let column = 0; column < CLOUD_GRID_RESOLUTION; column += 1) {
-      const east = (column - half) * CLOUD_GRID_SPACING_METERS;
-      const north = (half - row) * CLOUD_GRID_SPACING_METERS;
-      samples.push({
-        ...offsetLocation(location, east, north),
-        column,
-        east,
-        north,
-        row
-      });
-    }
-  }
-  return samples;
 }
 
 function formatOpenMeteoUtcHour(time: Date): string {
@@ -486,27 +462,6 @@ function parseOpenMeteoLocalTime(value: string | undefined, offsetMs: number): n
   return Number.isFinite(parsed) ? parsed - offsetMs : undefined;
 }
 
-async function loadCachedJson<T>(cacheKey: string, ttlMs: number, url: string, signal: AbortSignal | undefined, label: string): Promise<T> {
-  if (signal?.aborted) {
-    throw new DOMException("Aborted", "AbortError");
-  }
-  const cached = await readPersistentCache<T>(cacheKey);
-  if (cached) {
-    return cached;
-  }
-  if (signal?.aborted) {
-    throw new DOMException("Aborted", "AbortError");
-  }
-
-  const response = await fetch(url, { signal });
-  if (!response.ok) {
-    throw new Error(`${label} returned ${response.status}`);
-  }
-  const body = (await response.json()) as T;
-  await writePersistentCache(cacheKey, body, ttlMs);
-  return body;
-}
-
 function openMeteoGridCacheKey(sourceKey: string, location: LocationPoint, targetHour: string, credential: string, url: string): string {
   return [
     "cloud",
@@ -527,10 +482,3 @@ function credentialFingerprint(credential: string): string {
   return trimmed ? hashNumber(trimmed).toString(36) : "public";
 }
 
-function errorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
-}
-
-function isAbortError(error: unknown, signal?: AbortSignal): boolean {
-  return signal?.aborted === true || (error instanceof DOMException && error.name === "AbortError");
-}

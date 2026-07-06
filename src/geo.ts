@@ -40,6 +40,32 @@ export function offsetLocation(center: LocationPoint, east: number, north: numbe
   };
 }
 
+export interface GridSample extends LocationPoint {
+  column: number;
+  east: number;
+  north: number;
+  row: number;
+}
+
+export function buildGridSamples(location: LocationPoint, resolution: number, spacingMeters: number): GridSample[] {
+  const samples: GridSample[] = [];
+  const half = Math.floor(resolution / 2);
+  for (let row = 0; row < resolution; row += 1) {
+    for (let column = 0; column < resolution; column += 1) {
+      const east = (column - half) * spacingMeters;
+      const north = (half - row) * spacingMeters;
+      samples.push({
+        ...offsetLocation(location, east, north),
+        column,
+        east,
+        north,
+        row
+      });
+    }
+  }
+  return samples;
+}
+
 export function localOffset(center: LocationPoint, point: Pick<LocationPoint, "lat" | "lon">): { east: number; north: number } {
   return {
     east: (point.lon - center.lon) * metersPerDegreeLon(center.lat),

@@ -88,6 +88,52 @@ export async function writePersistentCacheMany<T>(entries: CacheWrite<T>[], ttlM
   }).catch(() => undefined);
 }
 
+export function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true || (error instanceof DOMException && error.name === "AbortError");
+}
+
+export function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+}
+
+export function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+export async function loadCachedJson<T>(cacheKey: string, ttlMs: number, url: string, signal: AbortSignal | undefined, label: string): Promise<T> {
+  return loadCached(cacheKey, ttlMs, url, signal, label, (response) => response.json() as Promise<T>);
+}
+
+export async function loadCachedText(cacheKey: string, ttlMs: number, url: string, signal: AbortSignal | undefined, label: string): Promise<string> {
+  return loadCached(cacheKey, ttlMs, url, signal, label, (response) => response.text());
+}
+
+async function loadCached<T>(
+  cacheKey: string,
+  ttlMs: number,
+  url: string,
+  signal: AbortSignal | undefined,
+  label: string,
+  parse: (response: Response) => Promise<T>
+): Promise<T> {
+  throwIfAborted(signal);
+  const cached = await readPersistentCache<T>(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  throwIfAborted(signal);
+
+  const response = await fetch(url, { signal });
+  if (!response.ok) {
+    throw new Error(`${label} returned ${response.status}`);
+  }
+  const body = await parse(response);
+  await writePersistentCache(cacheKey, body, ttlMs);
+  return body;
+}
+
 export async function fetchCachedBlob(cacheName: string, url: string, ttlMs: number, signal?: AbortSignal): Promise<Blob> {
   if (signal?.aborted) {
     throw new DOMException("Aborted", "AbortError");

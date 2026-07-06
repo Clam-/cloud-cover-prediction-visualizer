@@ -1,6 +1,6 @@
-import { clamp, hashNumber, offsetLocation } from "../geo";
+import { buildGridSamples, clamp, degreesToRadians, hashNumber } from "../geo";
 import type { CloudDataMode, CloudLayer, CloudSnapshot, CloudVolume, LocationPoint } from "../types";
-import { fetchCachedBlob, readPersistentCache, writePersistentCache } from "./cache";
+import { fetchCachedBlob, isAbortError, readPersistentCache, throwIfAborted, writePersistentCache } from "./cache";
 
 type HrrrCloudFieldKey = "total" | CloudLayer;
 
@@ -313,36 +313,24 @@ function readHrrrCloudChunkValue(view: DataView, forecastIndex: number, localRow
 }
 
 function buildHrrrGridSamples(location: LocationPoint): HrrrCellSample[] {
+  const gridSamples = buildGridSamples(location, HRRR_CLOUD_GRID_RESOLUTION, HRRR_CLOUD_GRID_SPACING_METERS);
   const samples: HrrrCellSample[] = [];
-  const half = Math.floor(HRRR_CLOUD_GRID_RESOLUTION / 2);
-  let sampleIndex = 0;
-  for (let row = 0; row < HRRR_CLOUD_GRID_RESOLUTION; row += 1) {
-    for (let column = 0; column < HRRR_CLOUD_GRID_RESOLUTION; column += 1) {
-      const east = (column - half) * HRRR_CLOUD_GRID_SPACING_METERS;
-      const north = (half - row) * HRRR_CLOUD_GRID_SPACING_METERS;
-      const sampleLocation = offsetLocation(location, east, north);
-      const cell = locationToHrrrCell(sampleLocation);
-      if (!cell) {
-        sampleIndex += 1;
-        continue;
-      }
-      samples.push({
-        ...sampleLocation,
-        column,
-        east,
-        gridColumn: cell.gridColumn,
-        gridRow: cell.gridRow,
-        localColumn: cell.gridColumn % HRRR_CHUNK_COLUMNS,
-        localRow: cell.gridRow % HRRR_CHUNK_ROWS,
-        north,
-        row,
-        sampleIndex,
-        tileColumn: Math.floor(cell.gridColumn / HRRR_CHUNK_COLUMNS),
-        tileRow: Math.floor(cell.gridRow / HRRR_CHUNK_ROWS)
-      });
-      sampleIndex += 1;
+  gridSamples.forEach((sample, sampleIndex) => {
+    const cell = locationToHrrrCell(sample);
+    if (!cell) {
+      return;
     }
-  }
+    samples.push({
+      ...sample,
+      gridColumn: cell.gridColumn,
+      gridRow: cell.gridRow,
+      localColumn: cell.gridColumn % HRRR_CHUNK_COLUMNS,
+      localRow: cell.gridRow % HRRR_CHUNK_ROWS,
+      sampleIndex,
+      tileColumn: Math.floor(cell.gridColumn / HRRR_CHUNK_COLUMNS),
+      tileRow: Math.floor(cell.gridRow / HRRR_CHUNK_ROWS)
+    });
+  });
   return samples;
 }
 
@@ -655,20 +643,6 @@ function formatHrrrDate(value: number): string {
 
 function formatHrrrRunLabel(run: HrrrRun): string {
   return `${formatHrrrDate(run.initMs)} ${String(run.initHour).padStart(2, "0")}z F${String(run.forecastHour).padStart(2, "0")}`;
-}
-
-function degreesToRadians(value: number): number {
-  return (value * Math.PI) / 180;
-}
-
-function isAbortError(error: unknown, signal?: AbortSignal): boolean {
-  return signal?.aborted === true || (error instanceof DOMException && error.name === "AbortError");
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw new DOMException("Aborted", "AbortError");
-  }
 }
 
 class HrrrUnavailableError extends Error {

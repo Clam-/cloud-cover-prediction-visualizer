@@ -1,6 +1,7 @@
 import "./styles.css";
 import * as THREE from "three";
 import SunCalc from "suncalc";
+import { errorMessage, isAbortError } from "./data/cache";
 import { loadCloudSnapshot } from "./data/clouds";
 import { hrrrZarrCoversLocation } from "./data/hrrr";
 import { searchLocations } from "./data/geocoders";
@@ -1476,7 +1477,7 @@ function cloudVolumeKeyLabel(type: CloudVolumeType): string {
     return "magenta approximate";
   }
   if (type === "satelliteTop") {
-    return "teal satellite top";
+    return "orange satellite top";
   }
   return "pale modeled";
 }
@@ -1499,14 +1500,6 @@ function readFiniteParam(params: URLSearchParams, name: string): number | undefi
   }
   const value = Number(raw);
   return Number.isFinite(value) ? value : undefined;
-}
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
-}
-
-function errorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
 }
 
 const app = new HorizonApp();

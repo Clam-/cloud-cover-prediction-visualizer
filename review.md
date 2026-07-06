@@ -4,6 +4,21 @@
 **Focus:** accuracy of perspective and representation of peaks/valleys, clouds, and heights.
 **Method:** 9 finder passes (line-by-line, removed-behavior, cross-file, reuse, simplification, efficiency, altitude, conventions, minimap) → dedup → one adversarial verifier per candidate. All findings below survived verification (verdicts noted).
 
+> **Status: all findings and all "below the cut" items fixed** (2026-07-05, `tsc` + `vite build` clean).
+>
+> 1. HT/DQF now accept int16/int8 with `_Unsigned` reinterpretation of data, `_FillValue`, and `valid_range`.
+> 2. `clampProfileToSkyline` deleted; the ray march now does real occlusion (only samples rising above every nearer sample enter a band/skyline profile), which also made the depth-edge gate unnecessary.
+> 3. Vertical-FOV culling removed; `altitudeToY` clamps the projection angle just short of ±90° so off-screen summits still anchor fills without tan wraparound.
+> 4. `projectGoesFixedGrid` implements the GOES-R PUG visibility check, and satellite selection now picks the covering satellite (GOES **or** Himawari) with the smallest geocentric central angle (≤80°).
+> 5. Himawari fallback tops are ground-referenced (`altitudeReference: "ground"`) instead of fixed sea-level altitudes.
+> 6. Depth-raster vertices stay in view space (depth/right/up) through frustum clipping; screen y is projected after clipping with the same angle clamp.
+> 7. Minimap terrain mapping is isotropic (one meters-per-pixel fitted to the smaller canvas axis) across draw, marker, drag, and click paths.
+> 8. Raster tile zoom is frozen while a drag is active.
+> 9. POV marker falls back to canvas center when terrain is missing.
+> 10. Kept the orange render color (per request) and relabeled everything else: legend says "orange satellite top", swatch is now #e58f4d, README says orange.
+>
+> Below the cut: grid span is computed once per render from lattice corners and `MAX_TERRAIN_BAND_DISTANCE` is a module constant; `isAbortError`/`throwIfAborted`/`errorMessage`/`loadCachedJson`/`loadCachedText` are shared in `data/cache.ts` and `buildGridSamples` in `geo.ts` (clouds/hrrr/satellite/main all use them); curvature is back to `(1 − k) / 2R` with named constants (k = 0.166 ≈ the PeakFinder coefficient); satellite-top cover is a fixed nominal constant instead of a DQF-derived fabrication (the +8/+6 cover fudges are gone too); the GOES overlay download starts concurrently with the base cloud load and the decoded grid is memoized by `bucket:key`.
+
 ---
 
 ## Findings (most severe first)

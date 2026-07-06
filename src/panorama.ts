@@ -43,7 +43,7 @@ interface ProfileSegment {
 interface RasterClipVertex {
   depth: number;
   right: number;
-  y: number;
+  up: number;
 }
 
 interface RasterVertex {
@@ -69,11 +69,10 @@ const DEPTH_RASTER_MAX_HEIGHT = 420;
 const DEPTH_EDGE_BUCKETS = 5;
 const DEPTH_EDGE_LOG_THRESHOLD = 0.1;
 const MIN_RASTER_DEPTH_METERS = 1;
-const PROJECTED_POINT_VERTICAL_FOV_MARGIN_RADIANS = 0.08;
+// Angles at or beyond 90 degrees from the view axis would flip the sign of tan()
+// and project to the opposite screen edge, so cap just short of vertical.
+const MAX_PROJECTION_ANGLE_RADIANS = Math.PI / 2 - 0.01;
 const MAX_PROFILE_SCREEN_JUMP_RATIO = 0.38;
-const TERRAIN_DETAIL_DROP_RATIO = 0.075;
-const TERRAIN_DETAIL_DROP_MIN_PIXELS = 34;
-const TERRAIN_DETAIL_DROP_MAX_PIXELS = 88;
 const RAY_SAMPLE_GRID_STEP_RATIO = 0.32;
 const RAY_SAMPLE_MIN_STEP_METERS = 120;
 const RAY_SAMPLE_MAX_STEP_METERS = 520;
@@ -114,6 +113,7 @@ const TERRAIN_BANDS: TerrainBand[] = [
     lineWidth: 1.35
   }
 ];
+const MAX_TERRAIN_BAND_DISTANCE = TERRAIN_BANDS.reduce((maxDistance, band) => Math.max(maxDistance, band.maxDistance), 0);
 
 export class PanoramaRenderer {
   private readonly context: CanvasRenderingContext2D;
@@ -151,13 +151,12 @@ export class PanoramaRenderer {
     drawHorizon(context, width, horizonY);
 
     const skylineProfile = interpolateProfile(skyline);
-    const detailDrop = terrainDetailDrop(height);
     profiles.forEach((rawProfile, index) => {
-      const profile = clampProfileToSkyline(smoothProfile(interpolateProfile(rawProfile), 2), skylineProfile, detailDrop);
+      const profile = smoothProfile(interpolateProfile(rawProfile), 2);
       drawTerrainBand(context, profile, TERRAIN_BANDS[index], width, height);
     });
 
-    drawDepthDiscontinuities(context, depthRaster, skylineProfile, width, detailDrop);
+    drawDepthDiscontinuities(context, depthRaster);
     drawSkyline(context, skylineProfile, width, height);
   }
 
@@ -208,7 +207,8 @@ function altitudeToY(
   altitude: number,
   projection: Pick<ReturnType<typeof createProjection>, "focalY" | "height" | "pitch">
 ): number {
-  return projection.height / 2 - Math.tan(altitude - projection.pitch) * projection.focalY;
+  const angle = clamp(altitude - projection.pitch, -MAX_PROJECTION_ANGLE_RADIANS, MAX_PROJECTION_ANGLE_RADIANS);
+  return projection.height / 2 - Math.tan(angle) * projection.focalY;
 }
 
 function traceTerrainProfiles(
@@ -220,32 +220,52 @@ function traceTerrainProfiles(
   const profiles = TERRAIN_BANDS.map(() => new Array<ProfilePoint>(columnCount));
   const skyline = new Array<ProfilePoint>(columnCount);
   const sampleStep = terrainProfileSampleStep(grid);
+  const span = terrainGridSpan(grid);
+  if (!span) {
+    return { profiles, skyline };
+  }
 
   for (let column = 0; column < columnCount; column += 1) {
     const t = columnCount <= 1 ? 0.5 : column / (columnCount - 1);
     const angleOffset = t * projection.horizontalFov - projection.halfHorizontalFov;
     const bearing = wrapRadians(options.yaw + angleOffset);
-    const maxDistance = terrainRayMaxDistance(grid, bearing);
+    const maxDistance = terrainRayMaxDistance(span, bearing);
     if (maxDistance < MIN_SAMPLE_DISTANCE_METERS) {
       continue;
     }
 
+    // March near-to-far, keeping only samples that rise above everything nearer
+    // along the ray — occluded terrain never enters a band profile.
+    let horizonAltitude = Number.NEGATIVE_INFINITY;
     for (let distance = MIN_SAMPLE_DISTANCE_METERS; distance <= maxDistance; distance += sampleStep) {
-      const projected = projectTerrainRaySample(grid, options, projection, bearing, distance);
-      if (projected) {
-        recordProfilePoint(profiles, skyline, column, projected);
-      }
+      horizonAltitude = recordVisibleRaySample(grid, options, projection, profiles, skyline, column, bearing, distance, horizonAltitude);
     }
 
     if ((maxDistance - MIN_SAMPLE_DISTANCE_METERS) % sampleStep > sampleStep * 0.25) {
-      const projected = projectTerrainRaySample(grid, options, projection, bearing, maxDistance);
-      if (projected) {
-        recordProfilePoint(profiles, skyline, column, projected);
-      }
+      recordVisibleRaySample(grid, options, projection, profiles, skyline, column, bearing, maxDistance, horizonAltitude);
     }
   }
 
   return { profiles, skyline };
+}
+
+function recordVisibleRaySample(
+  grid: TerrainGrid,
+  options: PanoramaOptions,
+  projection: ReturnType<typeof createProjection>,
+  profiles: ProfilePoint[][],
+  skyline: ProfilePoint[],
+  column: number,
+  bearing: number,
+  distance: number,
+  horizonAltitude: number
+): number {
+  const projected = projectTerrainRaySample(grid, options, projection, bearing, distance);
+  if (!projected || projected.altitude <= horizonAltitude) {
+    return horizonAltitude;
+  }
+  recordProfilePoint(profiles, skyline, column, projected);
+  return projected.altitude;
 }
 
 function recordProfilePoint(
@@ -280,10 +300,6 @@ function projectTerrainRaySample(
 
   const apparentHeight = projectedTerrainHeight(elevation, grid.groundElevation, distance, options.verticalScale) - options.heightOffset;
   const altitude = Math.atan2(apparentHeight, distance);
-  if (!isWithinVerticalFov(altitude, projection, PROJECTED_POINT_VERTICAL_FOV_MARGIN_RADIANS)) {
-    return undefined;
-  }
-
   const y = altitudeToY(altitude, projection);
   if (!Number.isFinite(y)) {
     return undefined;
@@ -303,15 +319,10 @@ function terrainProfileSampleStep(grid: TerrainGrid): number {
   return clamp(gridSpacing * RAY_SAMPLE_GRID_STEP_RATIO, RAY_SAMPLE_MIN_STEP_METERS, RAY_SAMPLE_MAX_STEP_METERS);
 }
 
-function terrainRayMaxDistance(grid: TerrainGrid, bearing: number): number {
-  const span = terrainGridSpan(grid);
-  if (!span) {
-    return 0;
-  }
-
+function terrainRayMaxDistance(span: NonNullable<ReturnType<typeof terrainGridSpan>>, bearing: number): number {
   const eastLimit = axisRayLimit(Math.sin(bearing), span.minEast, span.maxEast);
   const northLimit = axisRayLimit(Math.cos(bearing), span.minNorth, span.maxNorth);
-  return Math.min(eastLimit, northLimit, maxTerrainBandDistance());
+  return Math.min(eastLimit, northLimit, MAX_TERRAIN_BAND_DISTANCE);
 }
 
 function axisRayLimit(direction: number, min: number, max: number): number {
@@ -321,10 +332,6 @@ function axisRayLimit(direction: number, min: number, max: number): number {
 
   const limit = direction > 0 ? max / direction : min / direction;
   return limit > 0 ? limit : 0;
-}
-
-function maxTerrainBandDistance(): number {
-  return TERRAIN_BANDS.reduce((maxDistance, band) => Math.max(maxDistance, band.maxDistance), 0);
 }
 
 function terrainGridSpan(grid: TerrainGrid):
@@ -339,29 +346,21 @@ function terrainGridSpan(grid: TerrainGrid):
     return undefined;
   }
 
-  let maxEast = Number.NEGATIVE_INFINITY;
-  let maxNorth = Number.NEGATIVE_INFINITY;
-  let minEast = Number.POSITIVE_INFINITY;
-  let minNorth = Number.POSITIVE_INFINITY;
-  for (const row of grid.samples) {
-    for (const sample of row) {
-      maxEast = Math.max(maxEast, sample.east);
-      maxNorth = Math.max(maxNorth, sample.north);
-      minEast = Math.min(minEast, sample.east);
-      minNorth = Math.min(minNorth, sample.north);
-    }
-  }
-
-  if (!Number.isFinite(minEast) || !Number.isFinite(maxEast) || !Number.isFinite(minNorth) || !Number.isFinite(maxNorth)) {
+  // The grid is a regular lattice, so its corners bound every sample.
+  const last = grid.resolution - 1;
+  const corners = [grid.samples[0][0], grid.samples[0][last], grid.samples[last][0], grid.samples[last][last]];
+  const easts = corners.map((corner) => corner.east);
+  const norths = corners.map((corner) => corner.north);
+  const span = {
+    maxEast: Math.max(...easts),
+    maxNorth: Math.max(...norths),
+    minEast: Math.min(...easts),
+    minNorth: Math.min(...norths)
+  };
+  if (!Number.isFinite(span.minEast) || !Number.isFinite(span.maxEast) || !Number.isFinite(span.minNorth) || !Number.isFinite(span.maxNorth)) {
     return undefined;
   }
-
-  return {
-    maxEast,
-    maxNorth,
-    minEast,
-    minNorth
-  };
+  return span;
 }
 
 function createDepthRaster(
@@ -386,7 +385,7 @@ function createDepthRaster(
   const vertices = Array.from({ length: surfaceResolution }, (_, z) =>
     Array.from({ length: surfaceResolution }, (_, x) => {
       const point = terrainSurfacePointAt(grid, x, z, surfaceResolution);
-      return point ? projectRasterVertex(point, grid, options, projection, height, rasterHeight) : undefined;
+      return point ? projectRasterVertex(point, grid, options) : undefined;
     })
   );
 
@@ -407,10 +406,7 @@ function createDepthRaster(
 function projectRasterVertex(
   point: TerrainSurfacePoint,
   grid: TerrainGrid,
-  options: PanoramaOptions,
-  projection: ReturnType<typeof createProjection>,
-  height: number,
-  rasterHeight: number
+  options: PanoramaOptions
 ): RasterClipVertex | undefined {
   const distance = Math.hypot(point.east, point.north);
   if (distance < MIN_SAMPLE_DISTANCE_METERS) {
@@ -419,27 +415,19 @@ function projectRasterVertex(
 
   const bearing = Math.atan2(point.east, point.north);
   const angleOffset = wrapRadians(bearing - options.yaw);
-  const apparentHeight = projectedTerrainHeight(point.elevation, grid.groundElevation, distance, options.verticalScale) - options.heightOffset;
-  const altitude = Math.atan2(apparentHeight, distance);
 
+  // Keep the vertex in view space (depth/right/up) so frustum clipping can lerp
+  // linearly; screen projection happens after clipping in rasterVertexFromClipVertex.
   return {
     depth: distance * Math.cos(angleOffset),
     right: distance * Math.sin(angleOffset),
-    y: (altitudeToY(altitude, projection) / Math.max(1, height - 1)) * (rasterHeight - 1)
+    up: projectedTerrainHeight(point.elevation, grid.groundElevation, distance, options.verticalScale) - options.heightOffset
   };
-}
-
-function isWithinVerticalFov(
-  altitude: number,
-  projection: Pick<ReturnType<typeof createProjection>, "halfVerticalFov" | "pitch">,
-  marginRadians = 0
-): boolean {
-  return Math.abs(altitude - projection.pitch) <= projection.halfVerticalFov + marginRadians;
 }
 
 function rasterizeClippedTriangle(
   raster: DepthRaster,
-  projection: Pick<ReturnType<typeof createProjection>, "halfHorizontalFov" | "horizontalFov">,
+  projection: ReturnType<typeof createProjection>,
   a: RasterClipVertex | undefined,
   b: RasterClipVertex | undefined,
   c: RasterClipVertex | undefined
@@ -453,7 +441,7 @@ function rasterizeClippedTriangle(
     return;
   }
 
-  const vertices = polygon.map((vertex) => rasterVertexFromClipVertex(vertex, projection, raster.width));
+  const vertices = polygon.map((vertex) => rasterVertexFromClipVertex(vertex, projection, raster));
   for (let index = 1; index < vertices.length - 1; index += 1) {
     rasterizeTriangle(raster, vertices[0], vertices[index], vertices[index + 1]);
   }
@@ -513,21 +501,22 @@ function intersectRasterClipEdge(
   return {
     depth: lerp(a.depth, b.depth, t),
     right: lerp(a.right, b.right, t),
-    y: lerp(a.y, b.y, t)
+    up: lerp(a.up, b.up, t)
   };
 }
 
 function rasterVertexFromClipVertex(
   vertex: RasterClipVertex,
-  projection: Pick<ReturnType<typeof createProjection>, "halfHorizontalFov" | "horizontalFov">,
-  rasterWidth: number
+  projection: ReturnType<typeof createProjection>,
+  raster: DepthRaster
 ): RasterVertex {
   const depth = Math.max(MIN_RASTER_DEPTH_METERS, vertex.depth);
   const angleOffset = Math.atan2(vertex.right, depth);
+  const altitude = Math.atan2(vertex.up, Math.hypot(depth, vertex.right));
   return {
     depth,
-    x: ((angleOffset + projection.halfHorizontalFov) / projection.horizontalFov) * (rasterWidth - 1),
-    y: vertex.y
+    x: ((angleOffset + projection.halfHorizontalFov) / projection.horizontalFov) * (raster.width - 1),
+    y: (altitudeToY(altitude, projection) / Math.max(1, projection.height - 1)) * (raster.height - 1)
   };
 }
 
@@ -652,26 +641,6 @@ function smoothProfile(profile: ProfilePoint[], passes: number): ProfilePoint[] 
   return current;
 }
 
-function clampProfileToSkyline(profile: ProfilePoint[], skyline: ProfilePoint[], maxDrop: number): ProfilePoint[] {
-  if (!profile.length || !skyline.length) {
-    return profile;
-  }
-
-  return profile.map((point, index) => {
-    if (!point) {
-      return undefined;
-    }
-
-    const skylinePoint = skyline[index];
-    if (!skylinePoint) {
-      return point;
-    }
-
-    const maxY = skylinePoint.y + maxDrop;
-    return point.y > maxY ? { ...point, y: maxY } : point;
-  });
-}
-
 function profileSegments(profile: ProfilePoint[], maxScreenJump = Number.POSITIVE_INFINITY): ProfileSegment[] {
   const segments: ProfileSegment[] = [];
   let active: ProfileSegment | undefined;
@@ -728,8 +697,7 @@ function drawTerrainBand(
   context.save();
   const step = width / Math.max(1, profile.length - 1);
 
-  const maxScreenJump = Math.max(180, height * MAX_PROFILE_SCREEN_JUMP_RATIO);
-  for (const segment of profileSegments(profile, maxScreenJump)) {
+  for (const segment of profileSegments(profile, maxProfileScreenJump(height))) {
     if (segment.points.length < 2) {
       continue;
     }
@@ -766,13 +734,7 @@ function drawTerrainBand(
   context.restore();
 }
 
-function drawDepthDiscontinuities(
-  context: CanvasRenderingContext2D,
-  raster: DepthRaster,
-  skyline: ProfilePoint[],
-  width: number,
-  maxDrop: number
-): void {
+function drawDepthDiscontinuities(context: CanvasRenderingContext2D, raster: DepthRaster): void {
   const paths = Array.from({ length: DEPTH_EDGE_BUCKETS }, () => new Path2D());
   const counts = new Array<number>(DEPTH_EDGE_BUCKETS).fill(0);
 
@@ -782,23 +744,29 @@ function drawDepthDiscontinuities(
       const depth = raster.depths[index];
 
       if (x < raster.width - 1) {
-        const x1 = (x + 1) * raster.cellWidth;
-        const y1 = y * raster.cellHeight;
-        const x2 = (x + 1) * raster.cellWidth;
-        const y2 = (y + 1) * raster.cellHeight;
-        if (isTerrainDetailVisible(skyline, width, maxDrop, x1, y1, x2, y2)) {
-          addDepthEdge(paths, counts, depth, raster.depths[index + 1], x1, y1, x2, y2);
-        }
+        addDepthEdge(
+          paths,
+          counts,
+          depth,
+          raster.depths[index + 1],
+          (x + 1) * raster.cellWidth,
+          y * raster.cellHeight,
+          (x + 1) * raster.cellWidth,
+          (y + 1) * raster.cellHeight
+        );
       }
 
       if (y < raster.height - 1) {
-        const x1 = x * raster.cellWidth;
-        const y1 = (y + 1) * raster.cellHeight;
-        const x2 = (x + 1) * raster.cellWidth;
-        const y2 = (y + 1) * raster.cellHeight;
-        if (isTerrainDetailVisible(skyline, width, maxDrop, x1, y1, x2, y2)) {
-          addDepthEdge(paths, counts, depth, raster.depths[index + raster.width], x1, y1, x2, y2);
-        }
+        addDepthEdge(
+          paths,
+          counts,
+          depth,
+          raster.depths[index + raster.width],
+          x * raster.cellWidth,
+          (y + 1) * raster.cellHeight,
+          (x + 1) * raster.cellWidth,
+          (y + 1) * raster.cellHeight
+        );
       }
     }
   }
@@ -818,43 +786,8 @@ function drawDepthDiscontinuities(
   context.restore();
 }
 
-function terrainDetailDrop(height: number): number {
-  return clamp(height * TERRAIN_DETAIL_DROP_RATIO, TERRAIN_DETAIL_DROP_MIN_PIXELS, TERRAIN_DETAIL_DROP_MAX_PIXELS);
-}
-
-function isTerrainDetailVisible(
-  skyline: ProfilePoint[],
-  width: number,
-  maxDrop: number,
-  x1: number,
-  y1: number,
-  x2: number,
-  y2: number
-): boolean {
-  const skylineY = profileYAtX(skyline, width, (x1 + x2) / 2);
-  return skylineY === undefined || Math.min(y1, y2) <= skylineY + maxDrop;
-}
-
-function profileYAtX(profile: ProfilePoint[], width: number, x: number): number | undefined {
-  if (!profile.length) {
-    return undefined;
-  }
-
-  const position = clamp((x / Math.max(1, width)) * (profile.length - 1), 0, profile.length - 1);
-  const leftIndex = Math.floor(position);
-  const rightIndex = Math.min(profile.length - 1, leftIndex + 1);
-  const left = profile[leftIndex];
-  const right = profile[rightIndex];
-  if (!left && !right) {
-    return undefined;
-  }
-  if (!left) {
-    return right!.y;
-  }
-  if (!right) {
-    return left.y;
-  }
-  return lerp(left.y, right.y, position - leftIndex);
+function maxProfileScreenJump(height: number): number {
+  return Math.max(180, height * MAX_PROFILE_SCREEN_JUMP_RATIO);
 }
 
 function addDepthEdge(
@@ -910,13 +843,12 @@ function drawSkyline(context: CanvasRenderingContext2D, profile: ProfilePoint[],
   }
 
   const step = width / Math.max(1, profile.length - 1);
-  const maxScreenJump = Math.max(180, height * MAX_PROFILE_SCREEN_JUMP_RATIO);
   context.save();
   context.strokeStyle = "rgba(5, 7, 7, 0.88)";
   context.lineWidth = 1.7;
   context.lineJoin = "round";
   context.lineCap = "round";
-  for (const segment of profileSegments(profile, maxScreenJump)) {
+  for (const segment of profileSegments(profile, maxProfileScreenJump(height))) {
     if (segment.points.length < 2) {
       continue;
     }
