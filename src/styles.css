@@ -483,6 +483,56 @@ select:focus-visible {
   color: rgba(255, 246, 210, 0.9);
 }
 
+.celestial-status {
+  display: grid;
+  gap: 3px;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 246, 210, 0.84);
+}
+
+.celestial-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 7px;
+}
+
+.celestial-status-label {
+  min-width: 34px;
+  color: rgba(255, 246, 210, 0.96);
+  font-weight: 700;
+}
+
+.celestial-status-value,
+.celestial-event {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.celestial-status-separator {
+  margin: 0 2px;
+  color: rgba(255, 246, 210, 0.44);
+}
+
+.celestial-event-icon {
+  display: inline-block;
+  color: rgba(255, 246, 210, 0.92);
+  font-size: 11px;
+  line-height: 1;
+  transform-origin: 50% 50%;
+}
+
+.celestial-event-rise .celestial-event-icon {
+  transform: rotate(-90deg);
+}
+
+.celestial-event-set .celestial-event-icon {
+  transform: rotate(90deg);
+}
+
 .diagnostic-entry {
   margin-top: 7px;
   padding-top: 7px;

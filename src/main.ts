@@ -1,6 +1,7 @@
 import "./styles.css";
 import * as THREE from "three";
 import SunCalc from "suncalc";
+import type { GetMoonIlluminationResult } from "suncalc";
 import { errorMessage, isAbortError } from "./data/cache";
 import { loadCloudSnapshot } from "./data/clouds";
 import { hrrrZarrCoversLocation } from "./data/hrrr";
@@ -64,6 +65,37 @@ interface CloudVolumeStyle {
   verticalScale: number;
 }
 
+type CelestialBody = "sun" | "moon";
+type CelestialHorizonEventType = "rise" | "set";
+
+interface CelestialPosition {
+  altitude: number;
+  azimuth: number;
+}
+
+interface CelestialHorizonEvent {
+  time: Date;
+  type: CelestialHorizonEventType;
+}
+
+interface CelestialInterval {
+  end: Date;
+  endsAtHorizon: boolean;
+  start: Date;
+  startsAtHorizon: boolean;
+}
+
+interface CelestialPathSegment {
+  positions: CelestialPosition[];
+}
+
+interface CelestialTrack {
+  alwaysAbove: boolean;
+  alwaysBelow: boolean;
+  intervals: CelestialInterval[];
+  segments: CelestialPathSegment[];
+}
+
 const canvas = element<HTMLCanvasElement>("scene");
 const panoramaCanvas = element<HTMLCanvasElement>("terrainPanorama");
 const searchForm = element<HTMLFormElement>("searchForm");
@@ -115,6 +147,12 @@ const TERRAIN_REUSE_RADIUS_FRACTION = 0.55;
 const CLOUD_RELOAD_DEBOUNCE_MS = 500;
 const REALTIME_CLOUD_REFRESH_MS = 5 * 60 * 1000;
 const CLOUD_REUSE_DISTANCE_METERS = 30000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const CELESTIAL_BODY_RADIUS_METERS = 52000;
+const CELESTIAL_PATH_RADIUS_METERS = 51500;
+const CELESTIAL_EVENT_SCAN_STEP_MS = 10 * 60 * 1000;
+const CELESTIAL_PATH_SAMPLE_MS = 10 * 60 * 1000;
+const CELESTIAL_HORIZON_ALTITUDE = 0;
 const CLOUD_VOLUME_TYPES: CloudVolumeType[] = ["modeled", "approximate", "satelliteTop"];
 const CLOUD_VOLUME_STYLES = {
   modeled: {
@@ -204,6 +242,9 @@ class HorizonApp {
   private readonly panorama = new PanoramaRenderer(panoramaCanvas);
   private readonly diagnostics = new Map<string, DiagnosticEntry>();
   private statusMessage = "Loading";
+  private settings = loadSettings();
+  private location = DEFAULT_LOCATION;
+  private time = roundToHour(new Date());
   private readonly miniMap = new MiniMap(
     element<HTMLCanvasElement>("miniMap"),
     element<HTMLElement>("miniMapPanel"),
@@ -215,8 +256,6 @@ class HorizonApp {
   private readonly sunLight = new THREE.DirectionalLight("#fff3c2", 1.4);
   private readonly ambient = new THREE.HemisphereLight("#bcd7ff", "#344c32", 0.62);
 
-  private settings = loadSettings();
-  private location = DEFAULT_LOCATION;
   private terrain?: TerrainGrid;
   private clouds?: CloudSnapshot;
   private terrainMesh?: THREE.Mesh;
@@ -226,7 +265,6 @@ class HorizonApp {
   private pitch = 0;
   private fov = 70;
   private heightOffset = 2;
-  private time = roundToHour(new Date());
   private cloudMode: CloudDataMode = "prediction";
   private loadId = 0;
   private cloudReloadId = 0;
@@ -240,6 +278,8 @@ class HorizonApp {
   private pendingEyeElevation?: number;
   private terrainDataKey?: string;
   private cloudDataKey?: string;
+  private sunTexture?: THREE.CanvasTexture;
+  private moonTexture?: { key: string; texture: THREE.CanvasTexture };
 
   async start(): Promise<void> {
     this.configureRenderer();
@@ -940,6 +980,9 @@ class HorizonApp {
     this.disposeGroupChildren(this.celestialGroup);
     const sun = SunCalc.getPosition(this.time, this.location.lat, this.location.lon);
     const moon = SunCalc.getMoonPosition(this.time, this.location.lat, this.location.lon);
+    const moonIllumination = SunCalc.getMoonIllumination(this.time);
+    const sunTrack = buildCelestialTrack("sun", this.time, this.location.lat, this.location.lon);
+    const moonTrack = buildCelestialTrack("moon", this.time, this.location.lat, this.location.lon);
     const sunAltitude = sun.altitude;
     const cloudDim = 1 - (this.clouds?.total ?? 0) / 170;
     const dayMix = clamp((sunAltitude + 0.14) / 0.9, 0, 1);
@@ -947,19 +990,52 @@ class HorizonApp {
     this.scene.background = skyColor;
     this.scene.fog = new THREE.FogExp2(skyColor, 0.000013 + ((this.clouds?.total ?? 0) / 100) * 0.000011);
 
-    this.addCelestial("sun", sun.azimuth, sun.altitude, 1700, "#fff0a5", sunAltitude > -0.1 ? 1 : 0.15);
-    this.addCelestial("moon", moon.azimuth, moon.altitude, 1050, "#dce7f5", moon.altitude > -0.05 ? 0.9 : 0.08);
+    this.addCelestialPath("sun", sunTrack, "#ffd979", 0.52);
+    this.addCelestialPath("moon", moonTrack, "#cbdcff", 0.44);
+    this.addCelestial("sun", sun.azimuth, sun.altitude, 1700, this.getSunTexture(), sunAltitude > -0.1 ? 1 : 0.15);
+    this.addCelestial("moon", moon.azimuth, moon.altitude, 1050, this.getMoonTexture(moonIllumination), moon.altitude > -0.05 ? 0.9 : 0.08, -moonIllumination.angle);
 
     const sunPosition = this.celestialToWorld(sun.azimuth, sun.altitude, 50000);
     this.sunLight.position.copy(sunPosition);
     this.sunLight.intensity = 0.3 + dayMix * 1.5;
     this.ambient.intensity = 0.34 + dayMix * 0.42;
+    this.renderDiagnostics();
   }
 
-  private addCelestial(name: string, azimuth: number, altitude: number, size: number, color: string, opacity: number): void {
-    const position = this.celestialToWorld(azimuth, altitude, 52000);
+  private addCelestialPath(name: CelestialBody, track: CelestialTrack, color: string, opacity: number): void {
+    track.segments.forEach((segment, index) => {
+      if (segment.positions.length < 2) {
+        return;
+      }
+      const points = segment.positions.map((position) => this.celestialToWorld(position.azimuth, position.altitude, CELESTIAL_PATH_RADIUS_METERS));
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({
+        color,
+        depthWrite: false,
+        opacity,
+        transparent: true
+      });
+      const line = new THREE.Line(geometry, material);
+      line.name = `${name}-path-${index}`;
+      this.celestialGroup.add(line);
+    });
+  }
+
+  private addCelestial(
+    name: CelestialBody,
+    azimuth: number,
+    altitude: number,
+    size: number,
+    texture: THREE.Texture,
+    opacity: number,
+    rotation = 0
+  ): void {
+    const position = this.celestialToWorld(azimuth, altitude, CELESTIAL_BODY_RADIUS_METERS);
     const material = new THREE.SpriteMaterial({
-      color,
+      alphaTest: 0.02,
+      color: "#ffffff",
+      map: texture,
+      rotation,
       transparent: true,
       opacity,
       depthWrite: false
@@ -969,6 +1045,40 @@ class HorizonApp {
     sprite.position.copy(position);
     sprite.scale.set(size, size, 1);
     this.celestialGroup.add(sprite);
+  }
+
+  private getSunTexture(): THREE.CanvasTexture {
+    if (this.sunTexture) {
+      return this.sunTexture;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = 128;
+    canvas.height = 128;
+    const context = canvas.getContext("2d");
+    if (!context) {
+      throw new Error("Unable to create sun texture");
+    }
+    const gradient = context.createRadialGradient(64, 64, 8, 64, 64, 62);
+    gradient.addColorStop(0, "rgba(255, 250, 202, 1)");
+    gradient.addColorStop(0.44, "rgba(255, 235, 134, 1)");
+    gradient.addColorStop(0.68, "rgba(255, 201, 92, 0.5)");
+    gradient.addColorStop(1, "rgba(255, 201, 92, 0)");
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    this.sunTexture = new THREE.CanvasTexture(canvas);
+    this.sunTexture.colorSpace = THREE.SRGBColorSpace;
+    return this.sunTexture;
+  }
+
+  private getMoonTexture(illumination: GetMoonIlluminationResult): THREE.CanvasTexture {
+    const key = `${illumination.phase.toFixed(3)}:${illumination.fraction.toFixed(3)}`;
+    if (this.moonTexture?.key === key) {
+      return this.moonTexture.texture;
+    }
+    this.moonTexture?.texture.dispose();
+    const texture = createMoonPhaseTexture(illumination);
+    this.moonTexture = { key, texture };
+    return texture;
   }
 
   private disposeGroupChildren(group: THREE.Group): void {
@@ -1259,6 +1369,8 @@ class HorizonApp {
     current.textContent = this.statusMessage;
     statusPill.append(current);
 
+    this.appendCelestialStatus();
+
     for (const diagnostic of this.diagnostics.values()) {
       const row = document.createElement("div");
       row.className = `diagnostic-entry diagnostic-${diagnostic.severity}`;
@@ -1266,6 +1378,21 @@ class HorizonApp {
       statusPill.append(row);
     }
     this.appendCloudVolumeKey();
+  }
+
+  private appendCelestialStatus(): void {
+    const moonIllumination = SunCalc.getMoonIllumination(this.time);
+    const status = document.createElement("div");
+    status.className = "celestial-status";
+    status.append(
+      celestialStatusRow("Sun", buildCelestialTrack("sun", this.time, this.location.lat, this.location.lon), this.time),
+      celestialStatusRow(
+        `Moon ${formatMoonIlluminationPercent(moonIllumination)}`,
+        buildCelestialTrack("moon", this.time, this.location.lat, this.location.lon),
+        this.time
+      )
+    );
+    statusPill.append(status);
   }
 
   private appendCloudVolumeKey(): void {
@@ -1491,6 +1618,299 @@ function cloudVolumeKeyItem(type: CloudVolumeType, label: string): HTMLElement {
   text.textContent = label;
   item.append(swatch, text);
   return item;
+}
+
+function buildCelestialTrack(body: CelestialBody, date: Date, lat: number, lon: number): CelestialTrack {
+  const dayStart = startOfLocalDay(date);
+  const dayEnd = new Date(dayStart.getTime() + DAY_MS);
+  const windowStart = new Date(dayStart.getTime() - DAY_MS);
+  const windowEnd = new Date(dayStart.getTime() + DAY_MS * 2);
+  const events = findCelestialHorizonEvents(body, windowStart, windowEnd, lat, lon);
+  const intervals = celestialVisibleIntervals(body, windowStart, windowEnd, lat, lon, events).filter(
+    (interval) => interval.end.getTime() >= dayStart.getTime() && interval.start.getTime() <= dayEnd.getTime()
+  );
+  const segments = intervals
+    .map((interval) => ({
+      positions: sampleCelestialInterval(body, interval, lat, lon)
+    }))
+    .filter((segment) => segment.positions.length > 1);
+  const hasBoundedInterval = intervals.some((interval) => interval.startsAtHorizon || interval.endsAtHorizon);
+  const coversWholeDay = intervals.some(
+    (interval) => interval.start.getTime() <= dayStart.getTime() && interval.end.getTime() >= dayEnd.getTime()
+  );
+
+  return {
+    alwaysAbove: coversWholeDay && !hasBoundedInterval,
+    alwaysBelow: intervals.length === 0,
+    intervals,
+    segments
+  };
+}
+
+function startOfLocalDay(date: Date): Date {
+  const start = new Date(date);
+  start.setHours(0, 0, 0, 0);
+  return start;
+}
+
+function findCelestialHorizonEvents(
+  body: CelestialBody,
+  start: Date,
+  end: Date,
+  lat: number,
+  lon: number
+): CelestialHorizonEvent[] {
+  const events: CelestialHorizonEvent[] = [];
+  let previousTime = start;
+  let previousAbove = celestialAltitude(body, previousTime, lat, lon) >= CELESTIAL_HORIZON_ALTITUDE;
+  let currentMs = start.getTime() + CELESTIAL_EVENT_SCAN_STEP_MS;
+
+  while (currentMs <= end.getTime()) {
+    const currentTime = new Date(currentMs);
+    const currentAbove = celestialAltitude(body, currentTime, lat, lon) >= CELESTIAL_HORIZON_ALTITUDE;
+    if (previousAbove !== currentAbove) {
+      events.push({
+        time: refineCelestialHorizonCrossing(body, previousTime, currentTime, lat, lon),
+        type: currentAbove ? "rise" : "set"
+      });
+    }
+    previousTime = currentTime;
+    previousAbove = currentAbove;
+    currentMs += CELESTIAL_EVENT_SCAN_STEP_MS;
+  }
+
+  if (previousTime.getTime() < end.getTime()) {
+    const currentAbove = celestialAltitude(body, end, lat, lon) >= CELESTIAL_HORIZON_ALTITUDE;
+    if (previousAbove !== currentAbove) {
+      events.push({
+        time: refineCelestialHorizonCrossing(body, previousTime, end, lat, lon),
+        type: currentAbove ? "rise" : "set"
+      });
+    }
+  }
+
+  return events;
+}
+
+function refineCelestialHorizonCrossing(body: CelestialBody, start: Date, end: Date, lat: number, lon: number): Date {
+  let low = start.getTime();
+  let high = end.getTime();
+  const lowAbove = celestialAltitude(body, start, lat, lon) >= CELESTIAL_HORIZON_ALTITUDE;
+
+  for (let index = 0; index < 28; index += 1) {
+    const middle = (low + high) / 2;
+    const middleAbove = celestialAltitude(body, new Date(middle), lat, lon) >= CELESTIAL_HORIZON_ALTITUDE;
+    if (middleAbove === lowAbove) {
+      low = middle;
+    } else {
+      high = middle;
+    }
+  }
+
+  return new Date((low + high) / 2);
+}
+
+function celestialVisibleIntervals(
+  body: CelestialBody,
+  windowStart: Date,
+  windowEnd: Date,
+  lat: number,
+  lon: number,
+  events: CelestialHorizonEvent[]
+): CelestialInterval[] {
+  const intervals: CelestialInterval[] = [];
+  let activeStart = celestialAltitude(body, windowStart, lat, lon) >= CELESTIAL_HORIZON_ALTITUDE ? windowStart : undefined;
+  let startsAtHorizon = false;
+
+  events.forEach((event) => {
+    if (event.type === "rise") {
+      activeStart = event.time;
+      startsAtHorizon = true;
+      return;
+    }
+
+    if (!activeStart) {
+      return;
+    }
+    intervals.push({
+      end: event.time,
+      endsAtHorizon: true,
+      start: activeStart,
+      startsAtHorizon
+    });
+    activeStart = undefined;
+    startsAtHorizon = false;
+  });
+
+  if (activeStart) {
+    intervals.push({
+      end: windowEnd,
+      endsAtHorizon: false,
+      start: activeStart,
+      startsAtHorizon
+    });
+  }
+
+  return intervals;
+}
+
+function sampleCelestialInterval(body: CelestialBody, interval: CelestialInterval, lat: number, lon: number): CelestialPosition[] {
+  const duration = interval.end.getTime() - interval.start.getTime();
+  if (duration <= 0) {
+    return [];
+  }
+
+  const sampleCount = Math.max(1, Math.ceil(duration / CELESTIAL_PATH_SAMPLE_MS));
+  const positions: CelestialPosition[] = [];
+  for (let index = 0; index <= sampleCount; index += 1) {
+    const time = new Date(interval.start.getTime() + (duration * index) / sampleCount);
+    const position = celestialPosition(body, time, lat, lon);
+    positions.push({
+      azimuth: position.azimuth,
+      altitude:
+        (index === 0 && interval.startsAtHorizon) || (index === sampleCount && interval.endsAtHorizon)
+          ? CELESTIAL_HORIZON_ALTITUDE
+          : Math.max(position.altitude, CELESTIAL_HORIZON_ALTITUDE)
+    });
+  }
+  return positions;
+}
+
+function celestialPosition(body: CelestialBody, date: Date, lat: number, lon: number): CelestialPosition {
+  return body === "sun" ? SunCalc.getPosition(date, lat, lon) : SunCalc.getMoonPosition(date, lat, lon);
+}
+
+function celestialAltitude(body: CelestialBody, date: Date, lat: number, lon: number): number {
+  return celestialPosition(body, date, lat, lon).altitude;
+}
+
+function celestialStatusRow(label: string, track: CelestialTrack, selectedTime: Date): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "celestial-status-row";
+  const name = document.createElement("span");
+  name.className = "celestial-status-label";
+  name.textContent = label;
+  const value = celestialStatusValue(track, selectedTime);
+  row.append(name, value);
+  return row;
+}
+
+function celestialStatusValue(track: CelestialTrack, selectedTime: Date): HTMLElement {
+  const value = document.createElement("span");
+  value.className = "celestial-status-value";
+  if (track.alwaysAbove) {
+    value.textContent = "above horizon all day";
+    return value;
+  }
+  if (track.alwaysBelow) {
+    value.textContent = "below horizon all day";
+    return value;
+  }
+  const interval = selectedCelestialInterval(track.intervals, selectedTime);
+  if (!interval) {
+    appendCelestialEvent(value, "rise", "--");
+    appendCelestialSeparator(value);
+    appendCelestialEvent(value, "set", "--");
+    return value;
+  }
+  const rise = interval.startsAtHorizon ? formatTime(interval.start) : "--";
+  const set = interval.endsAtHorizon ? formatTime(interval.end) : "--";
+  appendCelestialEvent(value, "rise", rise);
+  appendCelestialSeparator(value);
+  appendCelestialEvent(value, "set", set);
+  return value;
+}
+
+function appendCelestialEvent(container: HTMLElement, type: CelestialHorizonEventType, time: string): void {
+  const event = document.createElement("span");
+  event.className = `celestial-event celestial-event-${type}`;
+  event.setAttribute("aria-label", `${type} ${time}`);
+  event.title = type;
+
+  const icon = document.createElement("span");
+  icon.className = "celestial-event-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = "➜";
+
+  const text = document.createElement("span");
+  text.textContent = time;
+  event.append(icon, text);
+  container.append(event);
+}
+
+function appendCelestialSeparator(container: HTMLElement): void {
+  const separator = document.createElement("span");
+  separator.className = "celestial-status-separator";
+  separator.textContent = "";
+  container.append(separator);
+}
+
+function formatMoonIlluminationPercent(illumination: GetMoonIlluminationResult): string {
+  return `${Math.round(clamp(illumination.fraction, 0, 1) * 100)}%`;
+}
+
+function selectedCelestialInterval(intervals: CelestialInterval[], selectedTime: Date): CelestialInterval | undefined {
+  const selectedMs = selectedTime.getTime();
+  return (
+    intervals.find((interval) => interval.start.getTime() <= selectedMs && interval.end.getTime() >= selectedMs) ??
+    intervals.find((interval) => interval.start.getTime() >= selectedMs) ??
+    intervals[0]
+  );
+}
+
+function createMoonPhaseTexture(illumination: GetMoonIlluminationResult): THREE.CanvasTexture {
+  const size = 128;
+  const center = size / 2;
+  const radius = 58;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("Unable to create moon texture");
+  }
+
+  const image = context.createImageData(size, size);
+  const fraction = clamp(illumination.fraction, 0, 1);
+  const phase = ((illumination.phase % 1) + 1) % 1;
+  const lightZ = fraction * 2 - 1;
+  const lightX = Math.sqrt(Math.max(0, 1 - lightZ * lightZ)) * (phase <= 0.5 ? 1 : -1);
+
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const normalizedX = (x + 0.5 - center) / radius;
+      const normalizedY = (y + 0.5 - center) / radius;
+      const distanceSquared = normalizedX * normalizedX + normalizedY * normalizedY;
+      const offset = (y * size + x) * 4;
+      if (distanceSquared > 1) {
+        continue;
+      }
+
+      const normalZ = Math.sqrt(1 - distanceSquared);
+      const illuminationAmount = clamp((normalizedX * lightX + normalZ * lightZ) / 0.04 + 0.5, 0, 1);
+      const limbShade = 0.72 + normalZ * 0.28;
+      const edgeAlpha = clamp((1 - Math.sqrt(distanceSquared)) * radius, 0, 1);
+      image.data[offset] = mix(42, 222 * limbShade, illuminationAmount);
+      image.data[offset + 1] = mix(48, 232 * limbShade, illuminationAmount);
+      image.data[offset + 2] = mix(58, 244 * limbShade, illuminationAmount);
+      image.data[offset + 3] = 245 * edgeAlpha;
+    }
+  }
+
+  context.putImageData(image, 0, 0);
+  context.strokeStyle = "rgba(238, 246, 255, 0.5)";
+  context.lineWidth = 1.5;
+  context.beginPath();
+  context.arc(center, center, radius - 0.75, 0, Math.PI * 2);
+  context.stroke();
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function mix(start: number, end: number, amount: number): number {
+  return start + (end - start) * amount;
 }
 
 function readFiniteParam(params: URLSearchParams, name: string): number | undefined {
