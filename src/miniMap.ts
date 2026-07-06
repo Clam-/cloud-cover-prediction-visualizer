@@ -1,4 +1,4 @@
-import { clamp, latLonToWorldPixel, lonLatToTile, offsetLocation, worldPixelToLonLat } from "./geo";
+import { clamp, latLonToWorldPixel, localOffset, offsetLocation, worldPixelToLonLat } from "./geo";
 import { fetchCachedBlob } from "./data/cache";
 import type { LocationPoint, MapSource, Settings, TerrainGrid } from "./types";
 
@@ -6,6 +6,15 @@ interface RasterTile {
   image: HTMLImageElement;
   objectUrl?: string;
   ready: boolean;
+}
+
+interface PointerDownState {
+  moved: boolean;
+  pointerId: number;
+  startCenter: LocationPoint;
+  startZoom: number;
+  x: number;
+  y: number;
 }
 
 const RASTER_TILE_CACHE_LIMIT = 192;
@@ -19,9 +28,10 @@ export class MiniMap {
   private location?: LocationPoint;
   private yaw = Math.PI / 2;
   private settings?: Settings;
+  private viewportCenter?: LocationPoint;
   private resizeObserver: ResizeObserver;
   private zoomOffset = 0;
-  private pointerDown?: { x: number; y: number; pointerId: number };
+  private pointerDown?: PointerDownState;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -49,22 +59,34 @@ export class MiniMap {
       { passive: false }
     );
     this.canvas.addEventListener("pointerdown", (event) => this.onPointerDown(event));
+    this.canvas.addEventListener("pointermove", (event) => this.onPointerMove(event));
     this.canvas.addEventListener("pointerup", (event) => this.onPointerUp(event));
-    this.canvas.addEventListener("pointercancel", () => {
+    this.canvas.addEventListener("pointercancel", (event) => {
+      if (this.pointerDown?.pointerId === event.pointerId) {
+        this.canvas.releasePointerCapture(event.pointerId);
+      }
       this.pointerDown = undefined;
     });
     this.resize();
   }
 
   update(terrain: TerrainGrid | undefined, location: LocationPoint, yaw: number, settings: Settings): void {
+    const previousSource = this.settings?.mapSource;
+    const locationChanged =
+      !this.location || Math.abs(this.location.lat - location.lat) > 1e-9 || Math.abs(this.location.lon - location.lon) > 1e-9;
+
     this.terrain = terrain;
     this.location = location;
     this.yaw = yaw;
     this.settings = settings;
+    if (!this.viewportCenter || locationChanged || previousSource !== settings.mapSource) {
+      this.viewportCenter = location;
+    }
     this.draw();
   }
 
   center(): void {
+    this.viewportCenter = this.location;
     this.draw();
   }
 
@@ -90,14 +112,13 @@ export class MiniMap {
     const rasterDrawn = this.drawRasterBackground(source, width, height);
     if (!rasterDrawn) {
       this.drawTerrainBackground(width, height);
-    } else {
-      this.drawTerrainOverlay(width, height);
     }
     this.drawPov(width, height);
   }
 
   private drawRasterBackground(source: MapSource, width: number, height: number): boolean {
-    if (!this.location || !this.settings || source === "terrainCanvas") {
+    const centerLocation = this.mapCenter();
+    if (!centerLocation || !this.settings || source === "terrainCanvas") {
       this.attribution.textContent = "";
       this.reportRasterIssue?.();
       return false;
@@ -112,7 +133,7 @@ export class MiniMap {
 
     const zoom = this.pickZoom(width);
     const tileSize = 256;
-    const center = latLonToWorldPixel(this.location.lon, this.location.lat, zoom, tileSize);
+    const center = latLonToWorldPixel(centerLocation.lon, centerLocation.lat, zoom, tileSize);
     const topLeft = {
       x: center.x - width / 2,
       y: center.y - height / 2
@@ -151,12 +172,14 @@ export class MiniMap {
   }
 
   private drawTerrainOverlay(width: number, height: number): void {
-    if (!this.terrain) {
+    const centerLocation = this.mapCenter();
+    if (!this.terrain || !centerLocation) {
       return;
     }
 
     const terrain = this.terrain;
     const visibleExtent = terrain.extentMeters / this.currentTerrainZoom();
+    const centerOffset = localOffset(terrain.center, centerLocation);
     const min = terrain.minElevation;
     const max = Math.max(min + 1, terrain.maxElevation);
     const cellW = (width / (terrain.resolution - 1)) * this.currentTerrainZoom();
@@ -165,11 +188,13 @@ export class MiniMap {
     for (let z = 0; z < terrain.resolution; z += 1) {
       for (let x = 0; x < terrain.resolution; x += 1) {
         const sample = terrain.samples[z][x];
-        if (Math.abs(sample.east) > visibleExtent || Math.abs(sample.north) > visibleExtent) {
+        const east = sample.east - centerOffset.east;
+        const north = sample.north - centerOffset.north;
+        if (Math.abs(east) > visibleExtent || Math.abs(north) > visibleExtent) {
           continue;
         }
-        const px = ((sample.east + visibleExtent) / (visibleExtent * 2)) * width;
-        const py = height - ((sample.north + visibleExtent) / (visibleExtent * 2)) * height;
+        const px = ((east + visibleExtent) / (visibleExtent * 2)) * width;
+        const py = height - ((north + visibleExtent) / (visibleExtent * 2)) * height;
         const t = clamp((sample.elevation - min) / (max - min), 0, 1);
         const r = Math.round(26 + t * 172);
         const g = Math.round(78 + t * 118);
@@ -181,13 +206,18 @@ export class MiniMap {
   }
 
   private drawPov(width: number, height: number): void {
-    const cx = width / 2;
-    const cy = height / 2;
+    if (!this.location) {
+      return;
+    }
+    const point = this.pointForLocation(this.location, width, height);
+    if (!point) {
+      return;
+    }
     const lookX = Math.sin(this.yaw);
     const lookY = -Math.cos(this.yaw);
 
     this.context.save();
-    this.context.translate(cx, cy);
+    this.context.translate(point.x, point.y);
     this.context.strokeStyle = "rgba(255, 230, 160, 0.95)";
     this.context.lineWidth = 2;
     this.context.beginPath();
@@ -201,13 +231,46 @@ export class MiniMap {
     this.context.restore();
   }
 
-  private pickZoom(width: number): number {
-    if (!this.terrain || !this.location) {
+  private pointForLocation(location: LocationPoint, width: number, height: number): { x: number; y: number } | undefined {
+    const centerLocation = this.mapCenter();
+    if (!centerLocation) {
+      return undefined;
+    }
+
+    const source = this.settings?.mapSource ?? "terrainCanvas";
+    if (source !== "terrainCanvas" && this.settings) {
+      const zoom = this.pickZoom(width);
+      const tileSize = 256;
+      const center = latLonToWorldPixel(centerLocation.lon, centerLocation.lat, zoom, tileSize);
+      const point = latLonToWorldPixel(location.lon, location.lat, zoom, tileSize);
+      return {
+        x: point.x - center.x + width / 2,
+        y: point.y - center.y + height / 2
+      };
+    }
+
+    if (!this.terrain) {
+      return undefined;
+    }
+    const visibleExtent = this.terrain.extentMeters / this.currentTerrainZoom();
+    const offset = localOffset(centerLocation, location);
+    return {
+      x: ((offset.east + visibleExtent) / (visibleExtent * 2)) * width,
+      y: height - ((offset.north + visibleExtent) / (visibleExtent * 2)) * height
+    };
+  }
+
+  private pickZoom(width: number, centerLocation = this.mapCenter()): number {
+    if (!this.terrain || !centerLocation) {
       return clamp(10 + this.zoomOffset, 4, 18);
     }
     const metersPerPixel = (this.terrain.extentMeters * 2.2) / Math.max(width, 1);
-    const latRad = (this.location.lat * Math.PI) / 180;
+    const latRad = (centerLocation.lat * Math.PI) / 180;
     return clamp(Math.floor(Math.log2((156543.03392 * Math.cos(latRad)) / metersPerPixel)) + this.zoomOffset, 4, 18);
+  }
+
+  private mapCenter(): LocationPoint | undefined {
+    return this.viewportCenter ?? this.location;
   }
 
   private currentTerrainZoom(): number {
@@ -276,12 +339,34 @@ export class MiniMap {
     if (event.button !== 0) {
       return;
     }
+    const rect = this.canvas.getBoundingClientRect();
+    const center = this.mapCenter();
+    if (!center) {
+      return;
+    }
     this.pointerDown = {
+      moved: false,
+      startCenter: center,
+      startZoom: this.pickZoom(rect.width, center),
       x: event.clientX,
       y: event.clientY,
       pointerId: event.pointerId
     };
     this.canvas.setPointerCapture(event.pointerId);
+  }
+
+  private onPointerMove(event: PointerEvent): void {
+    if (!this.pointerDown || this.pointerDown.pointerId !== event.pointerId) {
+      return;
+    }
+    const distance = Math.hypot(event.clientX - this.pointerDown.x, event.clientY - this.pointerDown.y);
+    if (!this.pointerDown.moved && distance <= 5) {
+      return;
+    }
+    this.pointerDown.moved = true;
+    this.viewportCenter = this.centerAfterDrag(this.pointerDown, event);
+    event.preventDefault();
+    this.draw();
   }
 
   private onPointerUp(event: PointerEvent): void {
@@ -291,7 +376,7 @@ export class MiniMap {
     const pointerDown = this.pointerDown;
     this.pointerDown = undefined;
     this.canvas.releasePointerCapture(event.pointerId);
-    if (Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y) > 5) {
+    if (pointerDown.moved) {
       return;
     }
 
@@ -304,8 +389,29 @@ export class MiniMap {
     }
   }
 
+  private centerAfterDrag(pointerDown: PointerDownState, event: PointerEvent): LocationPoint {
+    const dx = event.clientX - pointerDown.x;
+    const dy = event.clientY - pointerDown.y;
+    const rect = this.canvas.getBoundingClientRect();
+    const source = this.settings?.mapSource ?? "terrainCanvas";
+    if (source !== "terrainCanvas" && this.settings) {
+      const tileSize = 256;
+      const center = latLonToWorldPixel(pointerDown.startCenter.lon, pointerDown.startCenter.lat, pointerDown.startZoom, tileSize);
+      return worldPixelToLonLat(center.x - dx, center.y - dy, pointerDown.startZoom, tileSize);
+    }
+
+    if (!this.terrain) {
+      return pointerDown.startCenter;
+    }
+    const visibleExtent = this.terrain.extentMeters / this.currentTerrainZoom();
+    const east = (-dx / Math.max(rect.width, 1)) * visibleExtent * 2;
+    const north = (dy / Math.max(rect.height, 1)) * visibleExtent * 2;
+    return offsetLocation(pointerDown.startCenter, east, north);
+  }
+
   private locationForPointer(event: PointerEvent): LocationPoint | undefined {
-    if (!this.location) {
+    const centerLocation = this.mapCenter();
+    if (!centerLocation) {
       return undefined;
     }
 
@@ -316,7 +422,7 @@ export class MiniMap {
     if (source !== "terrainCanvas" && this.settings) {
       const zoom = this.pickZoom(rect.width);
       const tileSize = 256;
-      const center = latLonToWorldPixel(this.location.lon, this.location.lat, zoom, tileSize);
+      const center = latLonToWorldPixel(centerLocation.lon, centerLocation.lat, zoom, tileSize);
       return worldPixelToLonLat(center.x - rect.width / 2 + x, center.y - rect.height / 2 + y, zoom, tileSize);
     }
 
@@ -326,7 +432,7 @@ export class MiniMap {
     const visibleExtent = this.terrain.extentMeters / this.currentTerrainZoom();
     const east = (x / Math.max(rect.width, 1) - 0.5) * visibleExtent * 2;
     const north = (0.5 - y / Math.max(rect.height, 1)) * visibleExtent * 2;
-    return offsetLocation(this.location, east, north);
+    return offsetLocation(centerLocation, east, north);
   }
 }
 

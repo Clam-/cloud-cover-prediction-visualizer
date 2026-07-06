@@ -331,7 +331,12 @@ select:focus-visible {
   width: 100%;
   height: calc(100% - 30px);
   display: block;
-  cursor: crosshair;
+  cursor: grab;
+  touch-action: none;
+}
+
+#miniMap:active {
+  cursor: grabbing;
 }
 
 .map-attribution {

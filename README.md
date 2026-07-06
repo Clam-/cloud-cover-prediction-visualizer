@@ -46,9 +46,9 @@ The app runs without paid accounts by using synthetic terrain as a guaranteed fa
 
 ### Map
 
-- Terrain canvas: no account. Draws the loaded terrain grid.
-- OpenStreetMap raster: no account, interactive use only, with visible attribution.
+- OpenStreetMap raster: no account, interactive use only, with visible attribution. This is the default mini map source.
 - Mapbox Outdoors raster: requires a Mapbox access token.
+- Terrain canvas: no account. Draws the loaded terrain grid instead of map tiles.
 
 ## Account Setup
 

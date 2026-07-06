@@ -14,7 +14,7 @@ export const defaultSettings: Settings = {
   terrainSource: "synthetic",
   cloudSource: "openMeteoGrid",
   geocoderSource: "openMeteo",
-  mapSource: "terrainCanvas",
+  mapSource: "osmRaster",
   apiKeys: {
     mapbox: "",
     openMeteo: ""
