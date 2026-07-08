@@ -52,6 +52,16 @@ interface InitialRoute {
   yaw?: number;
 }
 
+interface StoredView {
+  eyeElevation: number;
+  fov: number;
+  location: LocationPoint;
+  pitch: number;
+  savedAt: number;
+  version: 1;
+  yaw: number;
+}
+
 interface CloudPuffSpec {
   color: THREE.Color;
   matrix: THREE.Matrix4;
@@ -147,6 +157,9 @@ const TERRAIN_REUSE_RADIUS_FRACTION = 0.55;
 const CLOUD_RELOAD_DEBOUNCE_MS = 500;
 const REALTIME_CLOUD_REFRESH_MS = 5 * 60 * 1000;
 const CLOUD_REUSE_DISTANCE_METERS = 30000;
+const LAST_VIEW_STORAGE_KEY = "horizon-cloud-last-view";
+const LAST_VIEW_SAVE_IDLE_MS = 10000;
+const MAX_LOCATION_LABEL_LENGTH = 160;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CELESTIAL_BODY_RADIUS_METERS = 52000;
 const CELESTIAL_PATH_RADIUS_METERS = 51500;
@@ -269,6 +282,7 @@ class HorizonApp {
   private loadId = 0;
   private cloudReloadId = 0;
   private cloudReloadTimer?: number;
+  private lastViewSaveTimer?: number;
   private realtimeRefreshTimer?: number;
   private cloudTexture?: THREE.Texture;
   private terrainAbort?: AbortController;
@@ -289,13 +303,13 @@ class HorizonApp {
     this.updateConfigurationDiagnostics();
     this.updateDataModeUi();
     this.updateHud();
-    const initialRoute = this.readInitialRoute();
+    const initialRoute = this.readInitialRoute() ?? loadStoredView();
     if (initialRoute) {
       this.applyInitialRoute(initialRoute);
-      await this.warpTo(initialRoute.location, false);
+      await this.warpTo(initialRoute.location, false, false);
     } else {
       this.location = await this.detectInitialLocation();
-      await this.warpTo(this.location, true);
+      await this.warpTo(this.location, true, false);
     }
     this.animate();
   }
@@ -362,6 +376,8 @@ class HorizonApp {
   }
 
   private bindUi(): void {
+    window.addEventListener("pagehide", () => this.flushLastViewSave());
+
     canvas.addEventListener("contextmenu", (event) => event.preventDefault());
     canvas.addEventListener("pointerdown", (event) => this.onPointerDown(event));
     canvas.addEventListener("pointermove", (event) => this.onPointerMove(event));
@@ -382,16 +398,19 @@ class HorizonApp {
       this.setEyeElevation(eyeElevationFromSliderValue(Number(heightSlider.value)));
       this.updateHud();
       this.updateCamera();
+      this.scheduleLastViewSave();
     });
     heightSlider.addEventListener("change", () => {
       this.setEyeElevation(eyeElevationFromSliderValue(Number(heightSlider.value)), true);
       this.updateHud();
       this.updateCamera();
+      this.scheduleLastViewSave();
     });
     terrainHeightValue.addEventListener("click", () => {
       this.setEyeElevation(this.terrainElevation(), true);
       this.updateHud();
       this.updateCamera();
+      this.scheduleLastViewSave();
     });
 
     fovSlider.addEventListener("input", () => {
@@ -400,6 +419,7 @@ class HorizonApp {
       this.camera.updateProjectionMatrix();
       this.updateHud();
       this.renderPanorama();
+      this.scheduleLastViewSave();
     });
 
     timeStepButtons.forEach((button) => {
@@ -431,7 +451,7 @@ class HorizonApp {
       this.settings = resetSettings();
       this.populateSettingsForm();
       this.updateConfigurationDiagnostics();
-      void this.warpTo(this.location, false);
+      void this.warpTo(this.location, false, false);
     });
     settingsForm.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -440,7 +460,7 @@ class HorizonApp {
       settingsDialog.close();
       this.updateConfigurationDiagnostics();
       this.updateStatus("Reloading data sources");
-      void this.warpTo(this.location, false);
+      void this.warpTo(this.location, false, false);
     });
     mapCenterButton.addEventListener("click", () => this.miniMap.center());
   }
@@ -547,7 +567,7 @@ class HorizonApp {
     }
   }
 
-  private async warpTo(location: LocationPoint, faceEast: boolean): Promise<void> {
+  private async warpTo(location: LocationPoint, faceEast: boolean, rememberView = true): Promise<void> {
     this.loadId += 1;
     this.cloudReloadId += 1;
     const id = this.loadId;
@@ -642,6 +662,9 @@ class HorizonApp {
     this.updateMiniMap();
     this.updateLoadedDataDiagnostics();
     this.updateStatus(this.statusText());
+    if (rememberView) {
+      this.scheduleLastViewSave();
+    }
   }
 
   private scheduleCloudReload(): void {
@@ -1139,6 +1162,7 @@ class HorizonApp {
       this.pitch = clamp(this.pitch + dy * 0.003, -1.32, 1.32);
       this.updateCamera();
       this.updateMiniMap();
+      this.scheduleLastViewSave();
     }
   }
 
@@ -1149,6 +1173,9 @@ class HorizonApp {
     const drag = this.drag;
     this.drag = undefined;
     canvas.releasePointerCapture(event.pointerId);
+    if (drag.moved) {
+      this.scheduleLastViewSave();
+    }
     if (drag.button === 0 && !drag.moved) {
       this.pickTerrain(event);
     }
@@ -1187,6 +1214,42 @@ class HorizonApp {
 
   private updateMiniMap(): void {
     this.miniMap.update(this.terrain, this.location, this.yaw, this.settings);
+  }
+
+  private scheduleLastViewSave(): void {
+    if (this.lastViewSaveTimer !== undefined) {
+      window.clearTimeout(this.lastViewSaveTimer);
+    }
+    this.lastViewSaveTimer = window.setTimeout(() => this.saveLastView(), LAST_VIEW_SAVE_IDLE_MS);
+  }
+
+  private flushLastViewSave(): void {
+    if (this.lastViewSaveTimer === undefined) {
+      return;
+    }
+    window.clearTimeout(this.lastViewSaveTimer);
+    this.saveLastView();
+  }
+
+  private saveLastView(): void {
+    this.lastViewSaveTimer = undefined;
+    const view: StoredView = {
+      eyeElevation: clamp(Math.round(this.currentEyeElevation()), MIN_EYE_ELEVATION_METERS, MAX_EYE_ELEVATION_METERS),
+      fov: clamp(this.fov, 35, 110),
+      location: {
+        ...this.location,
+        label: sanitizeLocationLabel(this.location.label, this.location.lat, this.location.lon)
+      },
+      pitch: clamp(this.pitch, -1.32, 1.32),
+      savedAt: Date.now(),
+      version: 1,
+      yaw: normalizeAngleRadians(this.yaw)
+    };
+    try {
+      localStorage.setItem(LAST_VIEW_STORAGE_KEY, JSON.stringify(view));
+    } catch {
+      // Storage can be unavailable in private browsing or when quota is full.
+    }
   }
 
   private setCloudMode(mode: CloudDataMode): void {
@@ -1549,6 +1612,91 @@ function element<T extends HTMLElement>(id: string): T {
     throw new Error(`Missing element #${id}`);
   }
   return node as T;
+}
+
+function loadStoredView(): InitialRoute | undefined {
+  let raw: string | null;
+  try {
+    raw = localStorage.getItem(LAST_VIEW_STORAGE_KEY);
+  } catch {
+    return undefined;
+  }
+  if (!raw) {
+    return undefined;
+  }
+
+  try {
+    return parseStoredView(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
+}
+
+function parseStoredView(value: unknown): InitialRoute | undefined {
+  if (!isRecord(value) || !isRecord(value.location)) {
+    return undefined;
+  }
+
+  const lat = readFiniteNumber(value.location.lat);
+  const lon = readFiniteNumber(value.location.lon);
+  const yaw = readFiniteNumber(value.yaw);
+  const pitch = readFiniteNumber(value.pitch);
+  if (
+    lat === undefined ||
+    lon === undefined ||
+    yaw === undefined ||
+    pitch === undefined ||
+    Math.abs(lat) > 90 ||
+    Math.abs(lon) > 180
+  ) {
+    return undefined;
+  }
+
+  const elevation = readFiniteNumber(value.location.elevation);
+  const location: LocationPoint = {
+    lat,
+    lon,
+    label: sanitizeLocationLabel(value.location.label, lat, lon)
+  };
+  if (elevation !== undefined) {
+    location.elevation = elevation;
+  }
+
+  return {
+    eyeElevation: readClampedNumber(value.eyeElevation, MIN_EYE_ELEVATION_METERS, MAX_EYE_ELEVATION_METERS),
+    fov: readClampedNumber(value.fov, 35, 110),
+    location,
+    pitch: clamp(pitch, -1.32, 1.32),
+    yaw: normalizeAngleRadians(yaw)
+  };
+}
+
+function sanitizeLocationLabel(value: unknown, lat: number, lon: number): string {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length > 0 && trimmed.length <= MAX_LOCATION_LABEL_LENGTH && !/[\u0000-\u001f\u007f]/.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return `${formatCoordinate(lat, "lat")}, ${formatCoordinate(lon, "lon")}`;
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function readClampedNumber(value: unknown, min: number, max: number): number | undefined {
+  const number = readFiniteNumber(value);
+  return number === undefined ? undefined : clamp(number, min, max);
+}
+
+function normalizeAngleRadians(value: number): number {
+  const fullTurn = Math.PI * 2;
+  return ((value % fullTurn) + fullTurn) % fullTurn;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function setMeter(element: HTMLElement, value: number, hasData: boolean): void {
